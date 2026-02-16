@@ -27,6 +27,7 @@ SYNC_MAP = {
     "js/theme-toggle.js": "js/theme-toggle.js",
     # Assets
     "assets/skills_all.json": "assets/skills_all.json",
+    "assets/uma_skills.csv": "assets/uma_skills.csv",
     "assets/rank_badges.png": "assets/rank_badges.png",
     # Favicons
     "favicon.ico": "favicon.ico",

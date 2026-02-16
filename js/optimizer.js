@@ -1231,8 +1231,7 @@
     let lastErr = null;
     for (const url of candidates) {
       try {
-        // Use default caching - Vercel headers control TTL
-        const res = await fetch(url, { cache: 'force-cache' });
+        const res = await fetch(url);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const text = await res.text();
         const ok = loadFromCSVContent(text);
