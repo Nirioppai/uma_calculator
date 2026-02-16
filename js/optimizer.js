@@ -1,0 +1,3151 @@
+// Skill Optimizer Page Script
+// Loads skills from JSON or CSV, lets you select purchasable skills with costs,
+// and maximizes total score under a budget with gold cost and mutual-exclusion constraints.
+
+(function () {
+  const rowsEl = document.getElementById('rows');
+  const addRowBtn = document.getElementById('add-row');
+  const optimizeBtn = document.getElementById('optimize');
+  const clearAllBtn = document.getElementById('clear-all');
+  const budgetInput = document.getElementById('budget');
+  const fastLearnerToggle = document.getElementById('fast-learner');
+  const optimizeModeSelect = document.getElementById('optimize-mode');
+  const libStatus = document.getElementById('lib-status');
+  if (libStatus) libStatus.innerHTML = '<span class="loading-indicator">Loading skill library...</span>';
+
+  const resultsEl = document.getElementById('results');
+  const bestScoreEl = document.getElementById('best-score');
+  const usedPointsEl = document.getElementById('used-points');
+  const totalPointsEl = document.getElementById('total-points');
+  const remainingPointsEl = document.getElementById('remaining-points');
+  const selectedListEl = document.getElementById('selected-list');
+  const aptitudeScorePill = document.getElementById('aptitude-score-pill');
+  const aptitudeScoreEl = document.getElementById('aptitude-score');
+  const autoBuildBtn = document.getElementById('auto-build-btn');
+  const autoTargetInputs = document.querySelectorAll('input[name="auto-target"]');
+  const autoBuilderStatus = document.getElementById('auto-builder-status');
+  const saveBuildBtn = document.getElementById('save-build');
+  const shareBuildBtn = document.getElementById('share-build');
+  const viewBuildsBtn = document.getElementById('view-builds');
+
+  const saveBuildModal = document.getElementById('save-build-modal');
+  const saveBuildNameInput = document.getElementById('save-build-name');
+  const saveBuildDescInput = document.getElementById('save-build-description');
+  const saveModalClose = document.getElementById('save-modal-close');
+  const saveModalCancel = document.getElementById('save-modal-cancel');
+  const saveModalSave = document.getElementById('save-modal-save');
+
+  const buildsListModal = document.getElementById('builds-list-modal');
+  const buildsListContainer = document.getElementById('builds-list-container');
+  const buildsListModalClose = document.getElementById('builds-list-modal-close');
+  const buildsListModalCloseBtn = document.getElementById('builds-list-modal-close-btn');
+
+  const ratingInputs = {
+    speed: document.getElementById('stat-speed'),
+    stamina: document.getElementById('stat-stamina'),
+    power: document.getElementById('stat-power'),
+    guts: document.getElementById('stat-guts'),
+    wisdom: document.getElementById('stat-wisdom'),
+    star: document.getElementById('star-level'),
+    unique: document.getElementById('unique-level')
+  };
+  const ratingDisplays = {
+    stats: document.getElementById('rating-stats-score'),
+    skills: document.getElementById('rating-skills-score'),
+    unique: document.getElementById('rating-unique-bonus'),
+    total: document.getElementById('rating-total'),
+    badgeSprite: document.getElementById('rating-badge-sprite'),
+    floatTotal: document.getElementById('rating-float-total'),
+    floatBadgeSprite: document.getElementById('rating-float-badge-sprite'),
+    nextLabel: document.getElementById('rating-next-label'),
+    nextNeeded: document.getElementById('rating-next-needed'),
+    progressFill: document.getElementById('rating-progress-fill'),
+    progressBar: document.getElementById('rating-progress-bar'),
+    floatNextLabel: document.getElementById('rating-float-next-label'),
+    floatNextNeeded: document.getElementById('rating-float-next-needed'),
+    floatProgressFill: document.getElementById('rating-float-progress-fill'),
+    floatProgressBar: document.getElementById('rating-float-progress-bar')
+  };
+
+  // Race config selects (mirroring main page)
+  const cfg = {
+    turf: document.getElementById('cfg-turf'),
+    dirt: document.getElementById('cfg-dirt'),
+    sprint: document.getElementById('cfg-sprint'),
+    mile: document.getElementById('cfg-mile'),
+    medium: document.getElementById('cfg-medium'),
+    long: document.getElementById('cfg-long'),
+    front: document.getElementById('cfg-front'),
+    pace: document.getElementById('cfg-pace'),
+    late: document.getElementById('cfg-late'),
+    end: document.getElementById('cfg-end'),
+  };
+
+  const { normalize, updateAffinityStyles, getBucketForSkill, evaluateSkillScore } = RatingShared.createAffinityHelpers(cfg);
+  const ratingEngine = RatingShared.createRatingEngine({
+    ratingInputs,
+    ratingDisplays,
+    onChange: () => saveState()
+  });
+
+  let skillsByCategory = {};    // category -> [{ name, score, checkType }]
+  let categories = [];
+  const preferredOrder = ['golden','yellow','blue','green','red','purple','ius'];
+  let skillIndex = new Map();   // normalized name -> { name, score, checkType, category }
+  let skillIdIndex = new Map(); // id string -> skill object
+  let allSkillNames = [];
+
+  // Performance optimization: track active skill keys for O(1) duplicate detection
+  const activeSkillKeys = new Map(); // skillKey -> rowId
+
+  // Performance optimization: shared datalist for all skill inputs
+  let sharedSkillDatalist = null;
+  const HINT_DISCOUNT_STEP = 0.10;
+  const HINT_DISCOUNTS = { 0: 0.0, 1: 0.10, 2: 0.20, 3: 0.30, 4: 0.35, 5: 0.40 };
+  const HINT_LEVELS = [0, 1, 2, 3, 4, 5];
+
+  function getFastLearnerDiscount() {
+    return fastLearnerToggle && fastLearnerToggle.checked ? 0.10 : 0;
+  }
+
+  function getOptimizeMode() {
+    return optimizeModeSelect ? optimizeModeSelect.value : 'rating';
+  }
+
+  // Trainer Aptitude Test scoring: normal skills = 400, gold/rare skills = 1200
+  // Lower skills for gold combos don't count toward aptitude score
+  const APTITUDE_TEST_SCORE_NORMAL = 400;
+  const APTITUDE_TEST_SCORE_GOLD = 1200;
+
+  function getAptitudeTestScore(category, isLowerForGold = false) {
+    if (isLowerForGold) return 0; // Lower skills don't count
+    return isGoldCategory(category) ? APTITUDE_TEST_SCORE_GOLD : APTITUDE_TEST_SCORE_NORMAL;
+  }
+
+  function getHintDiscountPct(lvl) {
+    const discount = Object.prototype.hasOwnProperty.call(HINT_DISCOUNTS, lvl)
+      ? HINT_DISCOUNTS[lvl]
+      : (HINT_DISCOUNT_STEP * lvl);
+    return Math.round(discount * 100);
+  }
+
+  function getTotalHintDiscountPct(lvl) {
+    const base = Object.prototype.hasOwnProperty.call(HINT_DISCOUNTS, lvl)
+      ? HINT_DISCOUNTS[lvl]
+      : (HINT_DISCOUNT_STEP * lvl);
+    return Math.round((base + getFastLearnerDiscount()) * 100);
+  }
+  const skillCostMapNormalized = new Map(); // punctuation-stripped key -> meta
+  const skillCostMapExact = new Map(); // exact lowercased name -> meta
+  const skillCostById = new Map(); // skillId -> base cost
+  const skillMetaById = new Map(); // skillId -> { cost, versions, parents }
+
+  function normalizeCostKey(str) {
+    return normalize(str).replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
+  }
+
+  async function tryWriteClipboard(text) {
+    if (navigator?.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+    return false;
+  }
+
+  async function copyViaFallback(text) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    ta.style.pointerEvents = 'none';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    if (!ok) throw new Error('execCommand copy failed');
+  }
+
+  function calculateDiscountedCost(baseCost, hintLevel) {
+    if (typeof baseCost !== 'number' || isNaN(baseCost)) return NaN;
+    const lvl = Math.max(0, Math.min(5, parseInt(hintLevel, 10) || 0));
+    const discount = Object.prototype.hasOwnProperty.call(HINT_DISCOUNTS, lvl)
+      ? HINT_DISCOUNTS[lvl]
+      : (HINT_DISCOUNT_STEP * lvl);
+    const multiplier = Math.max(0, 1 - discount - getFastLearnerDiscount());
+    const rawCost = baseCost * multiplier;
+    const epsilon = 1e-9;
+    return Math.max(0, Math.floor(rawCost + epsilon));
+  }
+
+  function updateHintOptionLabels() {
+    const selects = rowsEl ? rowsEl.querySelectorAll('.hint-level') : [];
+    selects.forEach(select => {
+      Array.from(select.options).forEach(opt => {
+        const lvl = parseInt(opt.value, 10);
+        if (isNaN(lvl)) return;
+        opt.textContent = `Lv${lvl} (${getTotalHintDiscountPct(lvl)}% off)`;
+      });
+    });
+  }
+
+  function refreshAllRowCosts() {
+    const dataRows = rowsEl ? rowsEl.querySelectorAll('.optimizer-row') : [];
+    dataRows.forEach(row => {
+      if (typeof row.syncSkillCategory === 'function') {
+        row.syncSkillCategory({ triggerOptimize: false, allowLinking: false, updateCost: true });
+      }
+    });
+  }
+
+  async function loadSkillCostsJSON() {
+    const candidates = ['/assets/skills_all.json', './assets/skills_all.json'];
+    for (const url of candidates) {
+      try {
+        // Use default caching - Vercel headers control TTL
+        const res = await fetch(url, { cache: 'force-cache' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const list = await res.json();
+        if (!Array.isArray(list) || !list.length) continue;
+        list.forEach(entry => {
+          const name = entry?.name_en || entry?.enname;
+          if (!name) return;
+          const exactKey = normalize(name);
+          const key = normalizeCostKey(name);
+          const cost = (() => {
+            if (entry?.gene_version && typeof entry.gene_version.cost === 'number') return entry.gene_version.cost;
+            if (typeof entry?.cost === 'number') return entry.cost;
+            return null;
+          })();
+          const parents = Array.isArray(entry?.parent_skills) ? entry.parent_skills : [];
+          const versions = Array.isArray(entry?.versions) ? entry.versions : [];
+          const id = entry?.id;
+          if (cost !== null) {
+            const meta = { cost, id, parents, versions };
+            if (id !== undefined && id !== null) {
+              const sid = String(id);
+              if (!skillCostById.has(sid)) skillCostById.set(sid, cost);
+              if (!skillMetaById.has(sid)) skillMetaById.set(sid, { cost, parents, versions });
+            }
+            if (!skillCostMapExact.has(exactKey)) skillCostMapExact.set(exactKey, meta);
+            if (!skillCostMapNormalized.has(key)) skillCostMapNormalized.set(key, meta);
+          }
+        });
+        console.log(`Loaded skill costs from ${url}: ${skillCostMapExact.size} exact, ${skillCostMapNormalized.size} normalized`);
+        return true;
+      } catch (err) {
+        console.warn('Failed loading skill costs', url, err);
+      }
+    }
+    return false;
+  }
+
+
+  function setAutoStatus(message, isError = false) {
+    if (!autoBuilderStatus) return;
+    autoBuilderStatus.textContent = message || '';
+    autoBuilderStatus.dataset.state = isError ? 'error' : 'info';
+  }
+
+  function getSelectedAutoTargets() {
+    if (!autoTargetInputs || !autoTargetInputs.length) return [];
+    return Array.from(autoTargetInputs)
+      .filter(input => input.checked)
+      .map(input => normalize(input.value))
+      .filter(Boolean);
+  }
+
+  function setAutoTargetSelections(list) {
+    if (!autoTargetInputs || !autoTargetInputs.length) return;
+    const normalized = Array.isArray(list) ? new Set(list.map(v => normalize(v))) : null;
+    autoTargetInputs.forEach(input => {
+      if (!normalized || !normalized.size) {
+        input.checked = true;
+      } else {
+        input.checked = normalized.has(normalize(input.value));
+      }
+    });
+  }
+
+  let autoHighlightTimer = null;
+
+  function matchesAutoTargets(item, targetSet, includeGeneral) {
+    const check = normalize(item.checkType);
+    if (!check) return includeGeneral;
+    if (!targetSet.has(check)) return false;
+    return getBucketForSkill(item.checkType) === 'good';
+  }
+
+  function replaceRowsWithItems(items) {
+    if (!rowsEl) return;
+    clearAutoHighlights();
+    Array.from(rowsEl.querySelectorAll('.optimizer-row')).forEach(n => n.remove());
+    items.forEach(it => {
+      const row = makeRow();
+      rowsEl.appendChild(row);
+      const nameInput = row.querySelector('.skill-name');
+      if (nameInput) nameInput.value = it.name;
+      const costInput = row.querySelector('.cost');
+      if (costInput) costInput.value = it.cost;
+      row.dataset.skillCategory = it.category || '';
+      if (typeof row.syncSkillCategory === 'function') {
+        row.syncSkillCategory({ triggerOptimize: false, allowLinking: false, updateCost: false });
+      } else {
+        applyCategoryAccent(row, it.category || '');
+      }
+    });
+    ensureOneEmptyRow();
+    saveState();
+    autoOptimizeDebounced();
+  }
+
+  function clearAutoHighlights() {
+    if (autoHighlightTimer) {
+      clearTimeout(autoHighlightTimer);
+      autoHighlightTimer = null;
+    }
+    if (!rowsEl) return;
+    Array.from(rowsEl.querySelectorAll('.optimizer-row')).forEach(row => {
+      row.classList.remove('auto-picked');
+      row.classList.remove('auto-excluded');
+    });
+  }
+
+  function applyAutoHighlights(selectedIds = [], candidateIds = []) {
+    clearTimeout(autoHighlightTimer);
+    const selected = new Set(selectedIds);
+    const candidates = new Set(candidateIds);
+    Array.from(rowsEl.querySelectorAll('.optimizer-row')).forEach(row => {
+      const id = row.dataset.rowId;
+      if (!id) return;
+      row.classList.remove('auto-picked', 'auto-excluded');
+      if (!candidates.size || !candidates.has(id)) return;
+      if (selected.has(id)) row.classList.add('auto-picked');
+      else row.classList.add('auto-excluded');
+    });
+    autoHighlightTimer = setTimeout(() => clearAutoHighlights(), 4000);
+  }
+
+  function serializeRows() {
+    const rows = [];
+    rowsEl.querySelectorAll('.optimizer-row').forEach(row => {
+      const name = row.querySelector('.skill-name')?.value?.trim();
+      const costVal = row.querySelector('.cost')?.value;
+      const cost = typeof costVal === 'string' && costVal.length ? parseInt(costVal, 10) : NaN;
+      const hintVal = row.querySelector('.hint-level')?.value;
+      const hintLevel = parseInt(hintVal, 10);
+      const required = row.querySelector('.required-skill')?.checked;
+      if (!name || isNaN(cost)) return;
+      const hintSuffix = !isNaN(hintLevel) ? `|H${hintLevel}` : '';
+      const reqSuffix = required ? '|R' : '';
+      rows.push(`${name}=${cost}${hintSuffix}${reqSuffix}`);
+    });
+    return rows.join('\n');
+  }
+
+  function loadRowsFromString(str) {
+    const normalized = (str || '').replace(/\r\n?/g, '\n');
+    const entries = normalized.split(/\n+/).map(line => line.trim()).filter(Boolean);
+    if (!entries.length) throw new Error('No rows detected.');
+    Array.from(rowsEl.querySelectorAll('.optimizer-row')).forEach(n => n.remove());
+    clearAutoHighlights();
+    entries.forEach(entry => {
+      const [nameRaw, costRaw] = entry.split('=');
+      const name = (nameRaw || '').trim();
+      let costText = (costRaw || '').trim();
+      let hintLevel = 0;
+      let required = false;
+      if (/\|R\b/i.test(costText)) {
+        required = true;
+        costText = costText.replace(/\|R\b/ig, '').trim();
+      }
+      const hintMatch = costText.match(/\|H?\s*([0-5])\s*$/i);
+      if (hintMatch) {
+        hintLevel = parseInt(hintMatch[1], 10) || 0;
+        costText = costText.slice(0, hintMatch.index).trim();
+      }
+      const cost = parseInt(costText, 10);
+      if (!name || isNaN(cost)) return;
+      const row = makeRow();
+      rowsEl.appendChild(row);
+      const nameInput = row.querySelector('.skill-name');
+      const costInput = row.querySelector('.cost');
+      const hintSelect = row.querySelector('.hint-level');
+      const requiredToggle = row.querySelector('.required-skill');
+      if (nameInput) nameInput.value = name;
+      if (costInput) costInput.value = cost;
+      if (hintSelect) hintSelect.value = String(hintLevel);
+      if (requiredToggle) {
+        requiredToggle.checked = required;
+        row.classList.toggle('required', required);
+      }
+      if (typeof row.syncSkillCategory === 'function') {
+        row.syncSkillCategory({ triggerOptimize: false, allowLinking: false, updateCost: false });
+      } else {
+        applyCategoryAccent(row, row.dataset.skillCategory || '');
+      }
+    });
+    // After all rows are created, link gold skills to existing or auto-created lower rows.
+    const allRows = Array.from(rowsEl.querySelectorAll('.optimizer-row'));
+    const rowsBySkillId = new Map();
+    allRows.forEach(row => {
+      const name = (row.querySelector('.skill-name')?.value || '').trim();
+      const skill = findSkillByName(name);
+      if (skill?.skillId !== undefined && skill?.skillId !== null) {
+        rowsBySkillId.set(String(skill.skillId), row);
+      }
+    });
+    allRows.forEach(row => {
+      if (row.dataset.parentGoldId) return;
+      const name = (row.querySelector('.skill-name')?.value || '').trim();
+      const skill = findSkillByName(name);
+      if (!skill) return;
+      if (!isGoldCategory(skill.category)) return;
+      if (row.dataset.lowerRowId) return;
+      const candidateIds = [];
+      if (skill.lowerSkillId) candidateIds.push(skill.lowerSkillId);
+      if (Array.isArray(skill.parentIds) && skill.parentIds.length) {
+        candidateIds.push(...skill.parentIds);
+      }
+      let linkedRow = null;
+      candidateIds.some(cid => {
+        const found = rowsBySkillId.get(String(cid));
+        if (found && found !== row) {
+          linkedRow = found;
+          return true;
+        }
+        return false;
+      });
+      if (linkedRow) {
+        const lowerId = linkedRow.dataset.rowId || '';
+        row.dataset.lowerRowId = lowerId;
+        linkedRow.dataset.parentGoldId = row.dataset.rowId || '';
+        linkedRow.classList.add('linked-lower');
+        const linkedInput = linkedRow.querySelector('.skill-name');
+        if (linkedInput) linkedInput.placeholder = 'Lower skill...';
+        const linkedRemove = linkedRow.querySelector('.remove');
+        if (linkedRemove) {
+          linkedRemove.disabled = true;
+          linkedRemove.title = 'Remove the gold row to unlink';
+          linkedRemove.style.pointerEvents = 'none';
+          linkedRemove.style.opacity = '0.4';
+        }
+        if (typeof linkedRow.syncSkillCategory === 'function') {
+          linkedRow.syncSkillCategory({ triggerOptimize: false, allowLinking: false, updateCost: true });
+        }
+        if (typeof row.syncSkillCategory === 'function') {
+          row.syncSkillCategory({ triggerOptimize: false, allowLinking: false, updateCost: true });
+        }
+      } else if (typeof row.syncSkillCategory === 'function') {
+        row.syncSkillCategory({ triggerOptimize: false, allowLinking: true, updateCost: true });
+      }
+    });
+    ensureOneEmptyRow();
+    saveState();
+    autoOptimizeDebounced();
+  }
+
+  // --- URL state ---
+  function encodeBuildToURL(buildString) {
+    try {
+      if (typeof LZString !== 'undefined' && LZString.compressToEncodedURIComponent) {
+        return LZString.compressToEncodedURIComponent(buildString);
+      }
+      const encoded = btoa(unescape(encodeURIComponent(buildString)))
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+      return encoded;
+    } catch (err) {
+      console.error('Failed to encode build', err);
+      return '';
+    }
+  }
+
+  function decodeBuildFromURL(encoded) {
+    try {
+      if (typeof LZString !== 'undefined' && LZString.decompressFromEncodedURIComponent) {
+        const decoded = LZString.decompressFromEncodedURIComponent(encoded);
+        if (decoded) return decoded;
+      }
+      const base64 = encoded.replace(/-/g, '+').replace(/_/g, '/');
+      const padding = '='.repeat((4 - (base64.length % 4)) % 4);
+      const decoded = decodeURIComponent(escape(atob(base64 + padding)));
+      return decoded;
+    } catch (err) {
+      console.error('Failed to decode build', err);
+      return '';
+    }
+  }
+
+  // Minimal LZ-String (compressToEncodedURIComponent + decompressFromEncodedURIComponent)
+  // Keeps share URLs much shorter without a backend.
+  const LZString = (function() {
+    const f = String.fromCharCode;
+    const keyStrUriSafe = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-$';
+    const getBaseValue = (alphabet, character) => alphabet.indexOf(character);
+    function compressToEncodedURIComponent(input) {
+      if (input == null) return '';
+      return _compress(input, 6, (a) => keyStrUriSafe.charAt(a));
+    }
+    function decompressFromEncodedURIComponent(input) {
+      if (input == null) return '';
+      if (input === '') return null;
+      return _decompress(input.length, 32, (index) => getBaseValue(keyStrUriSafe, input.charAt(index)));
+    }
+    function _compress(uncompressed, bitsPerChar, getCharFromInt) {
+      if (uncompressed == null) return '';
+      let i, value;
+      const context_dictionary = {};
+      const context_dictionaryToCreate = {};
+      let context_c = '';
+      let context_wc = '';
+      let context_w = '';
+      let context_enlargeIn = 2;
+      let context_dictSize = 3;
+      let context_numBits = 2;
+      let context_data = [];
+      let context_data_val = 0;
+      let context_data_position = 0;
+      for (let ii = 0; ii < uncompressed.length; ii += 1) {
+        context_c = uncompressed.charAt(ii);
+        if (!Object.prototype.hasOwnProperty.call(context_dictionary, context_c)) {
+          context_dictionary[context_c] = context_dictSize++;
+          context_dictionaryToCreate[context_c] = true;
+        }
+        context_wc = context_w + context_c;
+        if (Object.prototype.hasOwnProperty.call(context_dictionary, context_wc)) {
+          context_w = context_wc;
+        } else {
+          if (Object.prototype.hasOwnProperty.call(context_dictionaryToCreate, context_w)) {
+            if (context_w.charCodeAt(0) < 256) {
+              for (i = 0; i < context_numBits; i++) {
+                context_data_val = (context_data_val << 1);
+                if (context_data_position === bitsPerChar - 1) {
+                  context_data_position = 0;
+                  context_data.push(getCharFromInt(context_data_val));
+                  context_data_val = 0;
+                } else {
+                  context_data_position++;
+                }
+              }
+              value = context_w.charCodeAt(0);
+              for (i = 0; i < 8; i++) {
+                context_data_val = (context_data_val << 1) | (value & 1);
+                if (context_data_position === bitsPerChar - 1) {
+                  context_data_position = 0;
+                  context_data.push(getCharFromInt(context_data_val));
+                  context_data_val = 0;
+                } else {
+                  context_data_position++;
+                }
+                value = value >> 1;
+              }
+            } else {
+              value = 1;
+              for (i = 0; i < context_numBits; i++) {
+                context_data_val = (context_data_val << 1) | value;
+                if (context_data_position === bitsPerChar - 1) {
+                  context_data_position = 0;
+                  context_data.push(getCharFromInt(context_data_val));
+                  context_data_val = 0;
+                } else {
+                  context_data_position++;
+                }
+                value = 0;
+              }
+              value = context_w.charCodeAt(0);
+              for (i = 0; i < 16; i++) {
+                context_data_val = (context_data_val << 1) | (value & 1);
+                if (context_data_position === bitsPerChar - 1) {
+                  context_data_position = 0;
+                  context_data.push(getCharFromInt(context_data_val));
+                  context_data_val = 0;
+                } else {
+                  context_data_position++;
+                }
+                value = value >> 1;
+              }
+            }
+            context_enlargeIn--;
+            if (context_enlargeIn === 0) {
+              context_enlargeIn = Math.pow(2, context_numBits);
+              context_numBits++;
+            }
+            delete context_dictionaryToCreate[context_w];
+          } else {
+            value = context_dictionary[context_w];
+            for (i = 0; i < context_numBits; i++) {
+              context_data_val = (context_data_val << 1) | (value & 1);
+              if (context_data_position === bitsPerChar - 1) {
+                context_data_position = 0;
+                context_data.push(getCharFromInt(context_data_val));
+                context_data_val = 0;
+              } else {
+                context_data_position++;
+              }
+              value = value >> 1;
+            }
+          }
+          context_enlargeIn--;
+          if (context_enlargeIn === 0) {
+            context_enlargeIn = Math.pow(2, context_numBits);
+            context_numBits++;
+          }
+          context_dictionary[context_wc] = context_dictSize++;
+          context_w = String(context_c);
+        }
+      }
+      if (context_w !== '') {
+        if (Object.prototype.hasOwnProperty.call(context_dictionaryToCreate, context_w)) {
+          if (context_w.charCodeAt(0) < 256) {
+            for (i = 0; i < context_numBits; i++) {
+              context_data_val = (context_data_val << 1);
+              if (context_data_position === bitsPerChar - 1) {
+                context_data_position = 0;
+                context_data.push(getCharFromInt(context_data_val));
+                context_data_val = 0;
+              } else {
+                context_data_position++;
+              }
+            }
+            value = context_w.charCodeAt(0);
+            for (i = 0; i < 8; i++) {
+              context_data_val = (context_data_val << 1) | (value & 1);
+              if (context_data_position === bitsPerChar - 1) {
+                context_data_position = 0;
+                context_data.push(getCharFromInt(context_data_val));
+                context_data_val = 0;
+              } else {
+                context_data_position++;
+              }
+              value = value >> 1;
+            }
+          } else {
+            value = 1;
+            for (i = 0; i < context_numBits; i++) {
+              context_data_val = (context_data_val << 1) | value;
+              if (context_data_position === bitsPerChar - 1) {
+                context_data_position = 0;
+                context_data.push(getCharFromInt(context_data_val));
+                context_data_val = 0;
+              } else {
+                context_data_position++;
+              }
+              value = 0;
+            }
+            value = context_w.charCodeAt(0);
+            for (i = 0; i < 16; i++) {
+              context_data_val = (context_data_val << 1) | (value & 1);
+              if (context_data_position === bitsPerChar - 1) {
+                context_data_position = 0;
+                context_data.push(getCharFromInt(context_data_val));
+                context_data_val = 0;
+              } else {
+                context_data_position++;
+              }
+              value = value >> 1;
+            }
+          }
+          context_enlargeIn--;
+          if (context_enlargeIn === 0) {
+            context_enlargeIn = Math.pow(2, context_numBits);
+            context_numBits++;
+          }
+          delete context_dictionaryToCreate[context_w];
+        } else {
+          value = context_dictionary[context_w];
+          for (i = 0; i < context_numBits; i++) {
+            context_data_val = (context_data_val << 1) | (value & 1);
+            if (context_data_position === bitsPerChar - 1) {
+              context_data_position = 0;
+              context_data.push(getCharFromInt(context_data_val));
+              context_data_val = 0;
+            } else {
+              context_data_position++;
+            }
+            value = value >> 1;
+          }
+        }
+        context_enlargeIn--;
+        if (context_enlargeIn === 0) {
+          context_enlargeIn = Math.pow(2, context_numBits);
+          context_numBits++;
+        }
+      }
+      value = 2;
+      for (i = 0; i < context_numBits; i++) {
+        context_data_val = (context_data_val << 1) | (value & 1);
+        if (context_data_position === bitsPerChar - 1) {
+          context_data_position = 0;
+          context_data.push(getCharFromInt(context_data_val));
+          context_data_val = 0;
+        } else {
+          context_data_position++;
+        }
+        value = value >> 1;
+      }
+      while (true) {
+        context_data_val = (context_data_val << 1);
+        if (context_data_position === bitsPerChar - 1) {
+          context_data.push(getCharFromInt(context_data_val));
+          break;
+        } else context_data_position++;
+      }
+      return context_data.join('');
+    }
+    function _decompress(length, resetValue, getNextValue) {
+      const dictionary = [];
+      let next;
+      let enlargeIn = 4;
+      let dictSize = 4;
+      let numBits = 3;
+      let entry = '';
+      const result = [];
+      let i;
+      let w;
+      let bits, resb, maxpower, power;
+      const data = { val: getNextValue(0), position: resetValue, index: 1 };
+      for (i = 0; i < 3; i += 1) dictionary[i] = i;
+      bits = 0;
+      maxpower = Math.pow(2, 2);
+      power = 1;
+      while (power !== maxpower) {
+        resb = data.val & data.position;
+        data.position >>= 1;
+        if (data.position === 0) {
+          data.position = resetValue;
+          data.val = getNextValue(data.index++);
+        }
+        bits |= (resb > 0 ? 1 : 0) * power;
+        power <<= 1;
+      }
+      switch (next = bits) {
+        case 0:
+          bits = 0; maxpower = Math.pow(2, 8); power = 1;
+          while (power !== maxpower) {
+            resb = data.val & data.position;
+            data.position >>= 1;
+            if (data.position === 0) {
+              data.position = resetValue;
+              data.val = getNextValue(data.index++);
+            }
+            bits |= (resb > 0 ? 1 : 0) * power;
+            power <<= 1;
+          }
+          w = f(bits);
+          break;
+        case 1:
+          bits = 0; maxpower = Math.pow(2, 16); power = 1;
+          while (power !== maxpower) {
+            resb = data.val & data.position;
+            data.position >>= 1;
+            if (data.position === 0) {
+              data.position = resetValue;
+              data.val = getNextValue(data.index++);
+            }
+            bits |= (resb > 0 ? 1 : 0) * power;
+            power <<= 1;
+          }
+          w = f(bits);
+          break;
+        case 2:
+          return '';
+        default:
+          return '';
+      }
+      dictionary[3] = w;
+      result.push(w);
+      while (true) {
+        if (data.index > length) return '';
+        bits = 0; maxpower = Math.pow(2, numBits); power = 1;
+        while (power !== maxpower) {
+          resb = data.val & data.position;
+          data.position >>= 1;
+          if (data.position === 0) {
+            data.position = resetValue;
+            data.val = getNextValue(data.index++);
+          }
+          bits |= (resb > 0 ? 1 : 0) * power;
+          power <<= 1;
+        }
+        switch (next = bits) {
+          case 0:
+            bits = 0; maxpower = Math.pow(2, 8); power = 1;
+            while (power !== maxpower) {
+              resb = data.val & data.position;
+              data.position >>= 1;
+              if (data.position === 0) {
+                data.position = resetValue;
+                data.val = getNextValue(data.index++);
+              }
+              bits |= (resb > 0 ? 1 : 0) * power;
+              power <<= 1;
+            }
+            dictionary[dictSize++] = f(bits);
+            next = dictSize - 1;
+            enlargeIn--;
+            break;
+          case 1:
+            bits = 0; maxpower = Math.pow(2, 16); power = 1;
+            while (power !== maxpower) {
+              resb = data.val & data.position;
+              data.position >>= 1;
+              if (data.position === 0) {
+                data.position = resetValue;
+                data.val = getNextValue(data.index++);
+              }
+              bits |= (resb > 0 ? 1 : 0) * power;
+              power <<= 1;
+            }
+            dictionary[dictSize++] = f(bits);
+            next = dictSize - 1;
+            enlargeIn--;
+            break;
+          case 2:
+            return result.join('');
+        }
+        if (enlargeIn === 0) {
+          enlargeIn = Math.pow(2, numBits);
+          numBits++;
+        }
+        if (dictionary[next]) {
+          entry = dictionary[next];
+        } else {
+          if (next === dictSize) {
+            entry = w + w.charAt(0);
+          } else {
+            return '';
+          }
+        }
+        result.push(entry);
+        dictionary[dictSize++] = w + entry.charAt(0);
+        enlargeIn--;
+        w = entry;
+        if (enlargeIn === 0) {
+          enlargeIn = Math.pow(2, numBits);
+          numBits++;
+        }
+      }
+    }
+    return { compressToEncodedURIComponent, decompressFromEncodedURIComponent };
+  })();
+
+  function readFromURL() {
+    const hash = (location.hash || '').replace(/^#/, '');
+    const p = new URLSearchParams(hash || location.search);
+    const buildParam = p.get('b') || p.get('build');
+    if (!buildParam) return false;
+    try {
+      // Restore budget
+      const budget = p.get('k') || p.get('budget');
+      if (budget) budgetInput.value = parseInt(budget, 10) || 0;
+
+      // Restore fast learner
+      const fl = p.get('f') || p.get('fl');
+      if (fastLearnerToggle && fl !== null) {
+        fastLearnerToggle.checked = fl === '1' || fl === 'true';
+      }
+
+      // Restore optimize mode
+      const mode = p.get('m') || p.get('mode');
+      if (optimizeModeSelect && mode) {
+        optimizeModeSelect.value = mode;
+      }
+
+      // Restore race config
+      const cfgParam = p.get('c') || p.get('cfg');
+      if (cfgParam) {
+        const cfgParts = cfgParam.split(',');
+        const cfgKeys = ['turf', 'dirt', 'sprint', 'mile', 'medium', 'long', 'front', 'pace', 'late', 'end'];
+        cfgParts.forEach((val, i) => {
+          if (i < cfgKeys.length && cfg[cfgKeys[i]]) {
+            cfg[cfgKeys[i]].value = val || 'A';
+          }
+        });
+      }
+
+      // Restore rating stats
+      const ratingParam = p.get('r') || p.get('rating');
+      if (ratingParam) {
+        try {
+          const ratingData = JSON.parse(decodeURIComponent(ratingParam));
+          ratingEngine.applyRatingState(ratingData);
+        } catch (err) {
+          console.warn('Failed to parse rating data from URL', err);
+        }
+      }
+
+      // Restore auto targets
+      const targetsParam = p.get('t') || p.get('targets');
+      if (targetsParam) {
+        const targets = targetsParam.split(',').map(t => t.trim()).filter(Boolean);
+        if (targets.length) {
+          setAutoTargetSelections(targets);
+        }
+      }
+
+      // Load skills
+      const decoded = decodeBuildFromURL(buildParam);
+      if (!decoded) return false;
+      loadRowsFromString(decoded);
+
+      // Update UI to reflect loaded state
+      updateAffinityStyles();
+      updateHintOptionLabels();
+      ratingEngine.updateRatingDisplay();
+
+      return true;
+    } catch (err) {
+      console.error('Failed to load build from URL', err);
+      return false;
+    }
+  }
+
+  function writeToURL() {
+    const buildString = serializeRows();
+    if (!buildString) {
+      history.replaceState(null, '', location.pathname);
+      return;
+    }
+    const encoded = encodeBuildToURL(buildString);
+    if (!encoded) return;
+
+    const p = new URLSearchParams();
+    p.set('b', encoded);
+
+    // Add budget
+    const budget = parseInt(budgetInput.value, 10) || 0;
+    if (budget) p.set('k', String(budget));
+
+    // Add fast learner
+    if (fastLearnerToggle?.checked) {
+      p.set('f', '1');
+    }
+
+    // Add optimize mode
+    const mode = getOptimizeMode();
+    if (mode && mode !== 'rating') {
+      p.set('m', mode);
+    }
+
+    // Add race config (compact comma-separated)
+    const cfgKeys = ['turf', 'dirt', 'sprint', 'mile', 'medium', 'long', 'front', 'pace', 'late', 'end'];
+    const cfgValues = cfgKeys.map(k => cfg[k] ? cfg[k].value : 'A');
+    const cfgString = cfgValues.join(',');
+    if (cfgString && cfgString !== 'A,A,A,A,A,A,A,A,A,A') {
+      p.set('c', cfgString);
+    }
+
+    // Add rating stats
+    const ratingData = ratingEngine.readRatingState();
+    if (ratingData && (
+      ratingData.stats?.speed || ratingData.stats?.stamina || ratingData.stats?.power ||
+      ratingData.stats?.guts || ratingData.stats?.wisdom || ratingData.star || ratingData.unique
+    )) {
+      p.set('r', encodeURIComponent(JSON.stringify(ratingData)));
+    }
+
+    // Add auto targets
+    if (autoTargetInputs && autoTargetInputs.length) {
+      const targets = Array.from(autoTargetInputs)
+        .filter(input => input.checked)
+        .map(input => input.value);
+      if (targets.length) {
+        p.set('t', targets.join(','));
+      }
+    }
+
+    history.replaceState(null, '', `${location.pathname}#${p.toString()}`);
+  }
+
+  function autoBuildIdealSkills() {
+    if (!categories.length || !Object.keys(skillsByCategory).length) {
+      setAutoStatus('Skill library is still loading. Please try again once it finishes.', true);
+      return;
+    }
+    const targets = getSelectedAutoTargets();
+    if (!targets.length) {
+      setAutoStatus('Select at least one target aptitude before generating a build.', true);
+      return;
+    }
+    const budget = parseInt(budgetInput.value, 10);
+    if (isNaN(budget) || budget <= 0) {
+      setAutoStatus('Enter a valid positive skill points budget first.', true);
+      budgetInput && budgetInput.focus();
+      return;
+    }
+    const { items, rowsMeta } = collectItems();
+    if (!items.length) {
+      setAutoStatus('Add at least one recognized skill with a cost before generating a build.', true);
+      return;
+    }
+    const requiredSummary = expandRequired(items);
+    if (requiredSummary.requiredCost > budget) {
+      setAutoStatus('Required skills exceed the current budget.', true);
+      renderResults({ best: 0, chosen: [], used: 0, error: 'required_unreachable' }, budget);
+      return;
+    }
+    const includeGeneral = targets.includes('general');
+    const targetSet = new Set(targets.filter(t => t !== 'general'));
+    const optionalCandidates = items.filter(it => !requiredSummary.requiredIds.has(it.id) && matchesAutoTargets(it, targetSet, includeGeneral));
+    const candidates = optionalCandidates.concat(requiredSummary.requiredItems);
+    if (!candidates.length) {
+      setAutoStatus('No existing rows match the selected targets with S-A affinity.', true);
+      return;
+    }
+    const groups = buildGroups(optionalCandidates, rowsMeta);
+    const result = optimizeGrouped(groups, optionalCandidates, budget - requiredSummary.requiredCost);
+    if (result.error === 'required_unreachable') {
+      setAutoStatus('Required skills exceed the current budget.', true);
+      renderResults(result, budget);
+      return;
+    }
+    if (!result.chosen.length) {
+      setAutoStatus('Budget too low to purchase any of the matching skills you entered.', true);
+      return;
+    }
+    const mergedResult = {
+      ...result,
+      chosen: requiredSummary.requiredItems.concat(result.chosen),
+      used: result.used + requiredSummary.requiredCost,
+      best: result.best + requiredSummary.requiredScore
+    };
+    applyAutoHighlights(mergedResult.chosen.map(it => it.id), candidates.map(it => it.id));
+    renderResults(mergedResult, budget);
+    setAutoStatus(`Highlighted ${mergedResult.chosen.length}/${candidates.length} matching skills (cost ${mergedResult.used}/${budget}).`);
+  }
+
+  function clearResults() {
+    if (resultsEl) resultsEl.hidden = true;
+    if (bestScoreEl) bestScoreEl.textContent = '0';
+    if (usedPointsEl) usedPointsEl.textContent = '0';
+    if (totalPointsEl) totalPointsEl.textContent = String(parseInt(budgetInput.value || '0', 10) || 0);
+    if (remainingPointsEl) remainingPointsEl.textContent = totalPointsEl.textContent;
+    if (selectedListEl) selectedListEl.innerHTML = '';
+    lastSkillScore = 0;
+    ratingEngine.updateRatingDisplay(0);
+  }
+
+  // ---------- Live optimize helpers ----------
+  function debounce(fn, ms) { let t; return function(...args){ clearTimeout(t); t = setTimeout(() => fn.apply(this, args), ms); }; }
+
+  function tryAutoOptimize() {
+    const budget = parseInt(budgetInput.value, 10);
+    if (isNaN(budget) || budget < 0) return;
+    const { items, rowsMeta } = collectItems();
+    if (!items.length) return;
+    const requiredSummary = expandRequired(items);
+    if (requiredSummary.requiredCost > budget) {
+      renderResults({ best: 0, chosen: [], used: 0, error: 'required_unreachable' }, budget);
+      return;
+    }
+    const optionalItems = items.filter(it => !requiredSummary.requiredIds.has(it.id));
+    const groups = buildGroups(optionalItems, rowsMeta);
+    const result = optimizeGrouped(groups, optionalItems, budget - requiredSummary.requiredCost);
+    const mergedResult = {
+      ...result,
+      chosen: requiredSummary.requiredItems.concat(result.chosen),
+      used: result.used + requiredSummary.requiredCost,
+      best: result.best + requiredSummary.requiredScore
+    };
+    renderResults(mergedResult, budget);
+  }
+  const autoOptimizeDebounced = debounce(tryAutoOptimize, 120);
+
+  function rebuildSkillCaches() {
+    const nextIndex = new Map();
+    const nextIdIndex = new Map();
+    const names = [];
+    Object.entries(skillsByCategory).forEach(([category, list = []]) => {
+      list.forEach(skill => {
+        if (!skill || !skill.name) return;
+        const key = normalize(skill.name);
+        const enriched = { ...skill, category };
+        if (!nextIndex.has(key)) {
+          names.push(skill.name);
+        }
+        nextIndex.set(key, enriched);
+        if (skill.skillId) {
+          const sid = String(skill.skillId);
+          if (!nextIdIndex.has(sid)) nextIdIndex.set(sid, enriched);
+        }
+      });
+    });
+    skillIndex = nextIndex;
+    skillIdIndex = nextIdIndex;
+    const uniqueNames = Array.from(new Set(names));
+    uniqueNames.sort((a, b) => a.localeCompare(b));
+    allSkillNames = uniqueNames;
+    rebuildSharedDatalist();
+    refreshAllRows();
+  }
+
+  function findSkillByName(name) {
+    const key = normalize(name);
+    return skillIndex.get(key) || null;
+  }
+
+  function formatCategoryLabel(cat) {
+    if (!cat) return 'Auto';
+    const canon = canonicalCategory(cat);
+    if (canon === 'gold') return 'Gold';
+    if (canon === 'ius') return 'Unique';
+    return cat.charAt(0).toUpperCase() + cat.slice(1);
+  }
+
+  function applyFallbackSkills(reason) {
+    skillsByCategory = {
+      golden: [
+        { name: 'Concentration', score: { base: 508, good: 508, average: 415, bad: 369, terrible: 323 }, baseCost: 508, checkType: 'End' },
+        { name: 'Professor of Curvature', score: { base: 508, good: 508, average: 415, bad: 369, terrible: 323 }, baseCost: 508, checkType: 'Medium' }
+      ],
+      yellow: [
+        { name: 'Groundwork', score: { base: 217, good: 217, average: 177, bad: 158, terrible: 138 }, baseCost: 217, checkType: 'Front' },
+        { name: 'Corner Recovery', score: { base: 217, good: 217, average: 177, bad: 158, terrible: 138 }, baseCost: 217, checkType: 'Late' }
+      ],
+      blue: [ { name: 'Stealth Mode', score: { base: 195, good: 195, average: 159, bad: 142, terrible: 124 }, baseCost: 195, checkType: 'Late' } ]
+    };
+    categories = Object.keys(skillsByCategory);
+    rebuildSkillCaches();
+    libStatus.textContent = `Using fallback skills (${reason})`;
+  }
+
+  async function loadSkillsLib() {
+    const candidates = [ '../../libs/skills_lib.json', '../libs/skills_lib.json', './libs/skills_lib.json', '/libs/skills_lib.json' ];
+    let lib = null; let lastErr = null;
+    for (const url of candidates) {
+      try { const res = await fetch(url, { cache: 'force-cache' }); if (!res.ok) throw new Error(`HTTP ${res.status}`); lib = await res.json(); libStatus.textContent = `Loaded skills from ${url}`; break; } catch (e) { lastErr = e; }
+    }
+    if (!lib) { console.error('Failed to load skills_lib.json from all candidates', lastErr); applyFallbackSkills('not found / blocked'); return; }
+    skillsByCategory = {}; categories = [];
+    for (const [color, list] of Object.entries(lib)) {
+      if (!Array.isArray(list)) continue;
+      categories.push(color);
+      skillsByCategory[color] = list.map(item => ({
+        name: item.name,
+        score: item.score,
+        baseCost: item.baseCost || item.base || item.cost,
+        checkType: item['check-type'] || ''
+      }));
+    }
+    categories.sort((a, b) => { const ia = preferredOrder.indexOf(a), ib = preferredOrder.indexOf(b); if (ia !== -1 || ib !== -1) return (ia === -1 ? 999 : ia) - (ib === -1 ? 999 : ib); return a.localeCompare(b); });
+    rebuildSkillCaches();
+    const totalSkills = Object.values(skillsByCategory).reduce((acc, arr) => acc + arr.length, 0);
+    if (categories.length === 0 || totalSkills === 0) applyFallbackSkills('empty library'); else libStatus.textContent += ` \u2022 ${totalSkills} skills in ${categories.length} categories`;
+  }
+
+  function parseCSV(text) {
+    const rows = []; let i = 0, field = '', row = [], inQuotes = false;
+    while (i < text.length) {
+      const c = text[i];
+      if (inQuotes) { if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else { inQuotes = false; } } else { field += c; } }
+      else { if (c === '"') inQuotes = true; else if (c === ',') { row.push(field); field = ''; } else if (c === '\r') { } else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; } else { field += c; } }
+      i++;
+    }
+    if (field.length || row.length) { row.push(field); rows.push(row); }
+    return rows;
+  }
+
+  function loadFromCSVContent(csvText) {
+    const rows = parseCSV(csvText); if (!rows.length) return false;
+    const header = rows[0].map(h => (h || '').toString().trim().toLowerCase());
+    const idx = {
+      type: header.indexOf('skill_type'),
+      name: header.indexOf('name'),
+      base: header.indexOf('base_value'),
+      baseCost: header.indexOf('base'),        // new CSV uses `base` for raw cost
+      sa: header.indexOf('s_a'),
+      bc: header.indexOf('b_c'),
+      def: header.indexOf('d_e_f'),
+      g: header.indexOf('g'),
+      apt1: header.indexOf('apt_1'),
+      apt2: header.indexOf('apt_2'),
+      apt3: header.indexOf('apt_3'),
+      apt4: header.indexOf('apt_4'),
+      check: header.indexOf('affinity_role'),
+      checkAlt: header.indexOf('affinity')
+    };
+    if (idx.name === -1) return false;
+    const catMap = {};
+    for (let r = 1; r < rows.length; r++) {
+      const cols = rows[r]; if (!cols || !cols.length) continue;
+      const name = (cols[idx.name] || '').trim(); if (!name) continue;
+      const type = idx.type !== -1 ? (cols[idx.type] || '').trim().toLowerCase() : 'misc';
+      const baseCost = idx.baseCost !== -1 ? parseInt(cols[idx.baseCost] || '', 10) : NaN;
+      const base = idx.base !== -1 ? parseInt(cols[idx.base] || '', 10) : NaN;
+      const sa = idx.sa !== -1 ? parseInt(cols[idx.sa] || '', 10) : NaN;
+      const bc = idx.bc !== -1 ? parseInt(cols[idx.bc] || '', 10) : NaN;
+      const def = idx.def !== -1 ? parseInt(cols[idx.def] || '', 10) : NaN;
+      const g = idx.g !== -1 ? parseInt(cols[idx.g] || '', 10) : NaN;
+      // Alt columns used by the shipped CSV (apt_1..apt_4 for bucketed values)
+      const apt1 = idx.apt1 !== -1 ? parseInt(cols[idx.apt1] || '', 10) : NaN;
+      const apt2 = idx.apt2 !== -1 ? parseInt(cols[idx.apt2] || '', 10) : NaN;
+      const apt3 = idx.apt3 !== -1 ? parseInt(cols[idx.apt3] || '', 10) : NaN;
+      const apt4 = idx.apt4 !== -1 ? parseInt(cols[idx.apt4] || '', 10) : NaN;
+      const checkTypeRaw = idx.check !== -1 ? (cols[idx.check] || '').trim() : (idx.checkAlt !== -1 ? (cols[idx.checkAlt] || '').trim() : '');
+      const score = {};
+      const baseBucket = !isNaN(base) ? base : (!isNaN(baseCost) ? baseCost : NaN);
+      const goodVal = !isNaN(sa) ? sa : (!isNaN(apt1) ? apt1 : baseBucket);
+      const avgVal = !isNaN(bc) ? bc : (!isNaN(apt2) ? apt2 : goodVal);
+      const badVal = !isNaN(def) ? def : (!isNaN(apt3) ? apt3 : avgVal);
+      const terrVal = !isNaN(g) ? g : (!isNaN(apt4) ? apt4 : badVal);
+      if (!isNaN(baseBucket)) score.base = baseBucket;
+      if (!isNaN(goodVal)) score.good = goodVal;
+      if (!isNaN(avgVal)) score.average = avgVal;
+      if (!isNaN(badVal)) score.bad = badVal;
+      if (!isNaN(terrVal)) score.terrible = terrVal;
+      const exactKey = normalize(name);
+      const lookupKey = normalizeCostKey(name);
+      const meta = skillCostMapExact.get(exactKey) || skillCostMapNormalized.get(lookupKey) || null;
+      const resolvedCost = (meta && typeof meta.cost === 'number')
+        ? meta.cost
+        : (isNaN(baseCost) ? undefined : baseCost);
+      const isUnique = type === 'ius' || type.includes('ius');
+      const parents = !isUnique && Array.isArray(meta?.parents) ? meta.parents : [];
+      const lowerSkillId = !isUnique && Array.isArray(meta?.versions) && meta.versions.length ? String(meta.versions[0]) : '';
+      const skillId = meta?.id;
+      if (!catMap[type]) catMap[type] = [];
+      catMap[type].push({
+        name,
+        score,
+        baseCost: resolvedCost,
+        checkType: checkTypeRaw,
+        parentIds: parents,
+        skillId,
+        lowerSkillId
+      });
+    }
+    skillsByCategory = catMap; categories = Object.keys(catMap).sort((a,b)=>{const ia=preferredOrder.indexOf(a), ib=preferredOrder.indexOf(b); if(ia!==-1||ib!==-1) return (ia===-1?999:ia) - (ib===-1?999:ib); return a.localeCompare(b)});
+    const totalSkills = Object.values(skillsByCategory).reduce((acc, arr) => acc + arr.length, 0);
+    rebuildSkillCaches();
+    return true;
+  }
+
+  async function loadSkillsCSV() {
+    const candidates = [
+      // new canonical location (moved into assets and renamed)
+      '/assets/uma_skills.csv',
+      './assets/uma_skills.csv',
+    ];
+    let lastErr = null;
+    for (const url of candidates) {
+      try {
+        // Use default caching - Vercel headers control TTL
+        const res = await fetch(url, { cache: 'force-cache' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const text = await res.text();
+        const ok = loadFromCSVContent(text);
+        if (ok) {
+          return true;
+        }
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    console.error('Failed to load CSV from known locations', lastErr);
+    libStatus.textContent = 'Failed to load CSV (using fallback)';
+    applyFallbackSkills('CSV not found / blocked');
+    return false;
+  }
+
+  function isGoldCategory(cat) {
+    const v = (cat || '').toLowerCase();
+    return v === 'golden' || v === 'gold' || v.includes('gold');
+  }
+
+  function canonicalCategory(cat) {
+    const v = (cat || '').toLowerCase();
+    if (!v) return '';
+    if (v === 'golden' || v === 'gold' || v.includes('gold')) return 'gold';
+    if (v === 'ius' || v.includes('ius')) return 'ius';
+    if (v === 'yellow' || v === 'blue' || v === 'green' || v === 'red') return v;
+    return v;
+  }
+
+  function getBaseCategoryFromSkill(skill) {
+    if (!skill || !isGoldCategory(skill.category)) return '';
+    const candidateId =
+      skill.lowerSkillId ||
+      (Array.isArray(skill.parentIds) && skill.parentIds.length
+        ? skill.parentIds[0]
+        : '');
+    if (!candidateId) return '';
+    const lower = skillIdIndex.get(String(candidateId));
+    if (!lower) return '';
+    const base = canonicalCategory(lower.category);
+    return base && base !== 'gold' ? base : '';
+  }
+
+  function setBaseCategory(row, skill) {
+    if (!row) return;
+    delete row.dataset.baseCategory;
+    const base = getBaseCategoryFromSkill(skill);
+    if (base) row.dataset.baseCategory = base;
+  }
+
+  function getBaseCategoryForResult(item) {
+    if (!item || !isGoldCategory(item.category)) return '';
+    const candidateId =
+      item.lowerSkillId ||
+      (Array.isArray(item.parentIds) && item.parentIds.length
+        ? item.parentIds[0]
+        : '');
+    if (candidateId) {
+      const lower = skillIdIndex.get(String(candidateId));
+      if (lower) {
+        const base = canonicalCategory(lower.category);
+        return base && base !== 'gold' ? base : '';
+      }
+    }
+    if (item.skillId !== undefined && item.skillId !== null) {
+      const skill = skillIdIndex.get(String(item.skillId));
+      return getBaseCategoryFromSkill(skill);
+    }
+    return '';
+  }
+
+  function applyCategoryAccent(row, category) {
+    const cls = ['cat-gold','cat-yellow','cat-blue','cat-green','cat-red','cat-ius','cat-orange'];
+    row.classList.remove(...cls);
+    const c = canonicalCategory(category);
+    if (!c) return;
+    if (c === 'gold') row.classList.add('cat-gold');
+    else if (c === 'yellow') row.classList.add('cat-yellow');
+    else if (c === 'blue') row.classList.add('cat-blue');
+    else if (c === 'green') row.classList.add('cat-green');
+    else if (c === 'red') row.classList.add('cat-red');
+    else if (c === 'ius') row.classList.add('cat-ius');
+  }
+
+  // Performance optimization: create shared datalist once instead of per-row
+  function getOrCreateSharedDatalist() {
+    if (sharedSkillDatalist) return sharedSkillDatalist;
+    sharedSkillDatalist = document.createElement('datalist');
+    sharedSkillDatalist.id = 'skills-datalist-shared';
+    document.body.appendChild(sharedSkillDatalist);
+    rebuildSharedDatalist();
+    return sharedSkillDatalist;
+  }
+
+  function rebuildSharedDatalist() {
+    if (!sharedSkillDatalist) return;
+    sharedSkillDatalist.innerHTML = '';
+    const frag = document.createDocumentFragment();
+    allSkillNames.forEach(name => {
+      const opt = document.createElement('option');
+      opt.value = name;
+      frag.appendChild(opt);
+    });
+    sharedSkillDatalist.appendChild(frag);
+  }
+
+  function refreshAllRows() {
+    const dataRows = rowsEl.querySelectorAll('.optimizer-row');
+    dataRows.forEach(row => {
+      if (typeof row.syncSkillCategory === 'function') {
+        row.syncSkillCategory({ triggerOptimize: false, allowLinking: false, updateCost: false });
+      }
+    });
+  }
+
+  function isTopLevelRow(row) { return !row.dataset.parentGoldId; }
+  function isRowFilled(row) {
+    const name = (row.querySelector('.skill-name')?.value || '').trim();
+    const costVal = row.querySelector('.cost')?.value;
+    const cost = typeof costVal === 'string' && costVal.length ? parseInt(costVal, 10) : NaN;
+    const skillKnown = !!findSkillByName(name);
+    return skillKnown && !isNaN(cost) && cost >= 0;
+  }
+  function scrollRowIntoView(row, { focus = true } = {}) {
+    if (!row) return;
+    const input = row.querySelector('.skill-name');
+    const target = input || row;
+    requestAnimationFrame(() => {
+      target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      if (focus && input) input.focus({ preventScroll: true });
+    });
+  }
+  function shouldAutoScrollNewRow() {
+    return rowsEl && rowsEl.contains(document.activeElement);
+  }
+  function ensureOneEmptyRow() {
+    const rows = Array.from(rowsEl.querySelectorAll('.optimizer-row'))
+      .filter(isTopLevelRow);
+    if (!rows.length) { rowsEl.appendChild(makeRow()); return; }
+    const last = rows[rows.length - 1];
+    const lastFilled = isRowFilled(last);
+    if (lastFilled) {
+      const newRow = makeRow();
+      rowsEl.appendChild(newRow);
+      if (shouldAutoScrollNewRow()) scrollRowIntoView(newRow);
+    } else {
+      // Remove extra trailing empty top-level rows, keep exactly one empty
+      for (let i = rows.length - 2; i >= 0; i--) {
+        if (!isRowFilled(rows[i])) { rows[i].remove(); }
+        else break;
+      }
+    }
+  }
+
+  function clearAllRows() {
+    // Clean up skill key tracking and remove all rows
+    Array.from(rowsEl.querySelectorAll('.optimizer-row')).forEach(n => {
+      if (typeof n.cleanupSkillTracking === 'function') {
+        n.cleanupSkillTracking();
+      }
+      n.remove();
+    });
+    // add a fresh empty row and reset UI
+    rowsEl.appendChild(makeRow());
+    ensureOneEmptyRow();
+    clearResults();
+    saveState();
+  }
+
+  function makeRow() {
+    getOrCreateSharedDatalist(); // Ensure shared datalist exists
+    const row = document.createElement('div'); row.className = 'optimizer-row';
+    const id = Math.random().toString(36).slice(2);
+    row.dataset.rowId = id;
+    row.innerHTML = `
+      <div class="type-cell">
+        <label>Type</label>
+        <div class="category-chip" data-empty="true">Auto</div>
+      </div>
+      <div class="skill-cell">
+        <label>Skill</label>
+        <input type="text" class="skill-name field-control" list="skills-datalist-shared" placeholder="Start typing..." />
+        <div class="dup-warning" role="status" aria-live="polite"></div>
+      </div>
+      <div class="hint-cell">
+        <label>Hint Discount</label>
+        <div class="hint-controls">
+          <select class="hint-level field-control">
+            ${HINT_LEVELS.map(lvl => `<option value="${lvl}">Lv${lvl} (${getTotalHintDiscountPct(lvl)}% off)</option>`).join('')}
+          </select>
+          <div class="base-cost" data-empty="true">Base ?</div>
+        </div>
+      </div>
+      <div class="cost-cell">
+        <label>Cost</label>
+        <input type="number" min="0" step="1" class="cost field-control" placeholder="Cost" />
+      </div>
+      <div class="actions-cell">
+        <div class="required-cell">
+          <label>Must Buy</label>
+          <label class="required-toggle">
+            <input type="checkbox" class="required-skill" />
+            Lock
+          </label>
+        </div>
+        <div class="remove-cell">
+          <label class="remove-label">&nbsp;</label>
+          <button type="button" class="btn remove">Remove</button>
+        </div>
+      </div>
+    `;
+    const removeBtn = row.querySelector('.remove');
+    if (removeBtn) {
+      removeBtn.addEventListener('click', () => {
+        // Clean up skill key tracking for this row
+        if (typeof row.cleanupSkillTracking === 'function') {
+          row.cleanupSkillTracking();
+        }
+        if (row.dataset.lowerRowId) {
+          const linked = rowsEl.querySelector(`.optimizer-row[data-row-id="${row.dataset.lowerRowId}"]`);
+          if (linked) {
+            if (typeof linked.cleanupSkillTracking === 'function') {
+              linked.cleanupSkillTracking();
+            }
+            linked.remove();
+          }
+          delete row.dataset.lowerRowId;
+        }
+        row.remove();
+        saveState();
+        ensureOneEmptyRow();
+        autoOptimizeDebounced();
+      });
+    }
+    const skillInput = row.querySelector('.skill-name');
+    const categoryChip = row.querySelector('.category-chip');
+    const hintSelect = row.querySelector('.hint-level');
+    const dupWarning = row.querySelector('.dup-warning');
+    let dupWarningTimer = null;
+    const baseCostDisplay = row.querySelector('.base-cost');
+    const costInput = row.querySelector('.cost');
+    const requiredToggle = row.querySelector('.required-skill');
+
+    function getHintLevel() {
+      if (!hintSelect) return 0;
+      const val = parseInt(hintSelect.value, 10);
+      return isNaN(val) ? 0 : val;
+    }
+
+    function updateBaseCostDisplay(skill) {
+      if (!baseCostDisplay) return;
+      const baseCost = skill && typeof skill.baseCost === 'number' && !isNaN(skill.baseCost) ? skill.baseCost : NaN;
+      const baseScore = skill && skill.score && typeof skill.score === 'object' ? skill.score.base : NaN;
+      if (!isNaN(baseCost)) row.dataset.baseCost = String(baseCost); else delete row.dataset.baseCost;
+      const displayScore = !isNaN(baseScore) ? baseScore : evaluateSkillScore(skill || {});
+      if (!isNaN(displayScore)) {
+        baseCostDisplay.textContent = `Score ${displayScore}`;
+        baseCostDisplay.dataset.empty = 'false';
+      } else {
+        baseCostDisplay.textContent = 'Score ?';
+        baseCostDisplay.dataset.empty = 'true';
+      }
+    }
+
+    function getLowerDiscountedCost(skill) {
+      let lowerBaseCost = NaN;
+      let lowerHintLevel = 0;
+      if (row.dataset.lowerRowId) {
+        const linked = rowsEl.querySelector(`.optimizer-row[data-row-id="${row.dataset.lowerRowId}"]`);
+        if (linked) {
+          const linkedCostEl = linked.querySelector('.cost');
+          const linkedCostVal = parseInt(linkedCostEl?.value || '', 10);
+          if (!isNaN(linkedCostVal)) return linkedCostVal;
+          const hintEl = linked.querySelector('.hint-level');
+          const hintVal = parseInt(hintEl?.value || '0', 10);
+          lowerHintLevel = isNaN(hintVal) ? 0 : hintVal;
+          if (linked.dataset.baseCost) {
+            const parsed = parseInt(linked.dataset.baseCost, 10);
+            if (!isNaN(parsed)) lowerBaseCost = parsed;
+          }
+        }
+      }
+      if (isNaN(lowerBaseCost)) {
+        const candidateId = skill.lowerSkillId || (Array.isArray(skill.parentIds) ? skill.parentIds[0] : '');
+        if (candidateId) {
+          const lower = skillIdIndex.get(String(candidateId));
+          if (lower && typeof lower.baseCost === 'number') lowerBaseCost = lower.baseCost;
+          if (isNaN(lowerBaseCost)) {
+            const metaCost = skillCostById.get(String(candidateId));
+            if (typeof metaCost === 'number') lowerBaseCost = metaCost;
+          }
+        }
+      }
+      if (isNaN(lowerBaseCost)) return NaN;
+      return calculateDiscountedCost(lowerBaseCost, lowerHintLevel);
+    }
+
+    function applyHintedCost(skill) {
+      if (!costInput) return;
+      const baseCost = (() => {
+        if (skill && typeof skill.baseCost === 'number' && !isNaN(skill.baseCost)) return skill.baseCost;
+        if (row.dataset.baseCost) {
+          const parsed = parseInt(row.dataset.baseCost, 10);
+          return isNaN(parsed) ? NaN : parsed;
+        }
+        return NaN;
+      })();
+      if (isNaN(baseCost)) return;
+      const discounted = calculateDiscountedCost(baseCost, getHintLevel());
+      if (isNaN(discounted)) return;
+      const isGoldRow = isGoldCategory(row.dataset.skillCategory || '');
+      if (isGoldRow && skill) {
+        const lowerDiscounted = getLowerDiscountedCost(skill);
+        if (!isNaN(lowerDiscounted)) {
+          costInput.value = discounted + lowerDiscounted;
+          return;
+        }
+      }
+      costInput.value = discounted;
+    }
+
+    function setCategoryDisplay(category) {
+      row.dataset.skillCategory = category || '';
+      if (categoryChip) {
+        if (category) {
+          categoryChip.textContent = formatCategoryLabel(category);
+          categoryChip.dataset.empty = 'false';
+        } else {
+          categoryChip.textContent = 'Auto';
+          categoryChip.dataset.empty = 'true';
+        }
+      }
+      applyCategoryAccent(row, category);
+    }
+
+    function getSkillIdentity(name) {
+      const skill = findSkillByName(name);
+      const id = skill?.skillId ?? skill?.id ?? '';
+      const canonicalName = skill?.name || name;
+      return { id: id ? String(id) : '', name: canonicalName, skill };
+    }
+
+    function getSkillKey(identity) {
+      if (!identity || !identity.name) return '';
+      return identity.id || normalize(identity.name);
+    }
+
+    // O(1) duplicate check using activeSkillKeys map
+    function isDuplicateSkill(identity) {
+      const primaryKey = getSkillKey(identity);
+      if (!primaryKey) return false;
+      const existingRowId = activeSkillKeys.get(primaryKey);
+      return existingRowId !== undefined && existingRowId !== id;
+    }
+
+    // Update the activeSkillKeys map when this row's skill changes
+    function updateSkillKeyTracking(newIdentity) {
+      // Remove old key for this row
+      for (const [key, rowId] of activeSkillKeys) {
+        if (rowId === id) {
+          activeSkillKeys.delete(key);
+          break;
+        }
+      }
+      // Add new key if valid
+      const newKey = getSkillKey(newIdentity);
+      if (newKey) {
+        activeSkillKeys.set(newKey, id);
+      }
+    }
+
+    // Clean up when row is removed
+    function removeSkillKeyTracking() {
+      for (const [key, rowId] of activeSkillKeys) {
+        if (rowId === id) {
+          activeSkillKeys.delete(key);
+          break;
+        }
+      }
+    }
+
+    function showDupWarning(message) {
+      if (!dupWarning) return;
+      dupWarning.textContent = message;
+      dupWarning.classList.add('visible');
+      row.dataset.dupWarningHold = '1';
+      if (dupWarningTimer) window.clearTimeout(dupWarningTimer);
+      dupWarningTimer = window.setTimeout(() => {
+        if (dupWarning) {
+          dupWarning.textContent = '';
+          dupWarning.classList.remove('visible');
+        }
+        delete row.dataset.dupWarningHold;
+        dupWarningTimer = null;
+      }, 2500);
+    }
+
+    function clearDupWarning() {
+      if (!dupWarning) return;
+      if (row.dataset.dupWarningHold) return;
+      if (dupWarningTimer) {
+        window.clearTimeout(dupWarningTimer);
+        dupWarningTimer = null;
+      }
+      dupWarning.textContent = '';
+      dupWarning.classList.remove('visible');
+    }
+
+  function ensureLinkedLowerForGold(category, { allowCreate = true } = {}) {
+    if (row.dataset.parentGoldId) return;
+    const isGold = isGoldCategory(category);
+    const currentLinkedId = row.dataset.lowerRowId;
+    if (!isGold) {
+        if (currentLinkedId) {
+          const linked = rowsEl.querySelector(`.optimizer-row[data-row-id="${currentLinkedId}"]`);
+          if (linked) linked.remove();
+          delete row.dataset.lowerRowId;
+          saveState();
+          ensureOneEmptyRow();
+          autoOptimizeDebounced();
+        }
+        return;
+      }
+    if (!allowCreate || currentLinkedId) return;
+    const linked = makeRow();
+    linked.classList.add('linked-lower');
+    linked.dataset.parentGoldId = id;
+    const lid = linked.dataset.rowId;
+    const linkedInput = linked.querySelector('.skill-name');
+    if (linkedInput) linkedInput.placeholder = 'Lower skill...';
+    const linkedRemove = linked.querySelector('.remove');
+    if (linkedRemove) {
+      linkedRemove.disabled = true;
+      linkedRemove.title = 'Remove the gold row to unlink';
+      linkedRemove.style.pointerEvents = 'none';
+      linkedRemove.style.opacity = '0.4';
+    }
+    rowsEl.insertBefore(linked, row.nextSibling);
+    row.dataset.lowerRowId = lid;
+    if (typeof linked.syncSkillCategory === 'function') {
+      linked.syncSkillCategory({ triggerOptimize: false, allowLinking: false, updateCost: false });
+    }
+    autofillLinkedLower(linked);
+    saveState();
+    ensureOneEmptyRow();
+    autoOptimizeDebounced();
+  }
+
+    function ensureLinkedLowerForParent(skill, { allowCreate = true } = {}) {
+      if (!skill || !Array.isArray(skill.parentIds) || !skill.parentIds.length) return;
+      if (row.dataset.lowerRowId) {
+        const linked = rowsEl.querySelector(`.optimizer-row[data-row-id="${row.dataset.lowerRowId}"]`);
+        autofillLinkedLower(linked);
+        return;
+      }
+      if (!allowCreate) return;
+      const linked = makeRow();
+      linked.classList.add('linked-lower');
+      linked.dataset.parentSkillLink = id;
+      const lid = linked.dataset.rowId;
+      const linkedInput = linked.querySelector('.skill-name');
+      if (linkedInput) linkedInput.placeholder = 'Lower skill...';
+      const linkedRemove = linked.querySelector('.remove');
+      if (linkedRemove) {
+        linkedRemove.disabled = true;
+        linkedRemove.title = 'Remove the parent row to unlink';
+        linkedRemove.style.pointerEvents = 'none';
+        linkedRemove.style.opacity = '0.4';
+      }
+      rowsEl.insertBefore(linked, row.nextSibling);
+      row.dataset.lowerRowId = lid;
+      autofillLinkedLower(linked);
+      saveState();
+      ensureOneEmptyRow();
+      autoOptimizeDebounced();
+    }
+
+    function syncSkillCategory({ triggerOptimize = false, allowLinking = true, updateCost = false } = {}) {
+      if (!skillInput) return;
+      const rawName = (skillInput.value || '').trim();
+      if (!rawName) {
+        delete row.dataset.lastSkillName;
+        if (!row.dataset.dupWarningHold) clearDupWarning();
+        updateSkillKeyTracking(null); // Clear tracking when skill is removed
+      }
+      const identity = getSkillIdentity(rawName);
+      const skill = identity.skill;
+      if (rawName) {
+        const canonical = identity.name || rawName;
+        if (isDuplicateSkill(identity)) {
+          showDupWarning('This skill has already been added.');
+          const fallback = row.dataset.lastSkillName || '';
+          if (fallback) {
+            skillInput.value = fallback;
+            const prev = findSkillByName(fallback);
+            const prevCategory = prev ? prev.category : '';
+            setCategoryDisplay(prevCategory);
+            updateBaseCostDisplay(prev);
+            if (updateCost) applyHintedCost(prev);
+          } else {
+            skillInput.value = '';
+            setCategoryDisplay('');
+            updateBaseCostDisplay(null);
+            if (costInput) costInput.value = '';
+            delete row.dataset.baseCost;
+          }
+          return;
+        }
+        row.dataset.lastSkillName = canonical;
+        updateSkillKeyTracking(identity); // Update tracking with new skill
+      }
+      clearDupWarning();
+      const category = skill ? skill.category : '';
+      setCategoryDisplay(category);
+      setBaseCategory(row, skill);
+      updateBaseCostDisplay(skill);
+      ensureLinkedLowerForGold(category, { allowCreate: allowLinking });
+      ensureLinkedLowerForParent(skill, { allowCreate: allowLinking });
+      if (updateCost) applyHintedCost(skill);
+      if (triggerOptimize) {
+        saveState();
+        ensureOneEmptyRow();
+        autoOptimizeDebounced();
+      }
+    }
+
+    function autofillLinkedLower(linkedRow) {
+      if (!linkedRow || !skillInput) return;
+      const skill = findSkillByName(skillInput.value);
+      if (!skill) return;
+      // Prefer explicit lowerSkillId; otherwise, try parentIds (common for gold -> lower)
+      const candidateId = skill.lowerSkillId || (Array.isArray(skill.parentIds) ? skill.parentIds[0] : '');
+      if (!candidateId) return;
+      const lower = skillIdIndex.get(String(candidateId));
+      if (!lower) return;
+      const lowerInput = linkedRow.querySelector('.skill-name');
+      const lowerCostInput = linkedRow.querySelector('.cost');
+      const lowerHint = linkedRow.querySelector('.hint-level');
+      if (lowerInput && !lowerInput.value) lowerInput.value = lower.name;
+      const baseCost = typeof lower.baseCost === 'number' ? lower.baseCost : skillCostById.get(String(candidateId));
+      if (lowerCostInput && typeof baseCost === 'number') {
+        linkedRow.dataset.baseCost = String(baseCost);
+        const hintLevel = lowerHint ? parseInt(lowerHint.value || '0', 10) || 0 : (hintSelect ? parseInt(hintSelect.value || '0', 10) || 0 : 0);
+        const discounted = calculateDiscountedCost(baseCost, hintLevel);
+        if (!isNaN(discounted)) lowerCostInput.value = discounted;
+      }
+      if (typeof linkedRow.syncSkillCategory === 'function') {
+        linkedRow.syncSkillCategory({ triggerOptimize: false, allowLinking: false, updateCost: true });
+      }
+    }
+
+    row.syncSkillCategory = syncSkillCategory;
+    row.cleanupSkillTracking = removeSkillKeyTracking;
+    setCategoryDisplay(row.dataset.skillCategory || '');
+    if (skillInput) {
+      const syncFromInput = () => syncSkillCategory({ triggerOptimize: true, updateCost: true });
+      skillInput.addEventListener('input', syncFromInput);
+      skillInput.addEventListener('change', syncFromInput);
+      skillInput.addEventListener('blur', syncFromInput);
+      skillInput.addEventListener('keyup', (event) => {
+        if (event.key === 'Enter') syncFromInput();
+      });
+      let monitorId = null;
+      const startMonitor = () => {
+        if (monitorId) return;
+        let lastValue = skillInput.value;
+        monitorId = window.setInterval(() => {
+          if (!document.body.contains(skillInput)) return;
+          if (skillInput.value !== lastValue) {
+            lastValue = skillInput.value;
+            syncFromInput();
+          }
+        }, 120);
+      };
+      const stopMonitor = () => {
+        if (!monitorId) return;
+        window.clearInterval(monitorId);
+        monitorId = null;
+      };
+      skillInput.addEventListener('focus', startMonitor);
+      skillInput.addEventListener('blur', stopMonitor);
+    }
+    if (hintSelect) {
+      hintSelect.addEventListener('change', () => {
+        const skill = skillInput ? findSkillByName(skillInput.value) : null;
+        applyHintedCost(skill);
+        if (row.dataset.parentGoldId) {
+          const parent = rowsEl.querySelector(`.optimizer-row[data-row-id="${row.dataset.parentGoldId}"]`);
+          if (parent && typeof parent.syncSkillCategory === 'function') {
+            parent.syncSkillCategory({ triggerOptimize: false, allowLinking: false, updateCost: true });
+          }
+        }
+        saveState();
+        ensureOneEmptyRow();
+        autoOptimizeDebounced();
+      });
+    }
+    if (requiredToggle) {
+      requiredToggle.addEventListener('change', () => {
+        row.classList.toggle('required', requiredToggle.checked);
+        if (requiredToggle.checked) {
+          const isGoldRow = isGoldCategory(row.dataset.skillCategory || '');
+          if (isGoldRow) {
+            let linked = null;
+            if (row.dataset.lowerRowId) {
+              linked = rowsEl.querySelector(`.optimizer-row[data-row-id="${row.dataset.lowerRowId}"]`);
+            }
+            if (!linked) {
+              linked = rowsEl.querySelector(`.optimizer-row[data-parent-gold-id="${id}"]`);
+            }
+            if (linked) {
+              const linkedToggle = linked.querySelector('.required-skill');
+              if (linkedToggle) {
+                linkedToggle.checked = true;
+                linked.classList.add('required');
+              }
+            }
+          }
+        }
+        saveState();
+        ensureOneEmptyRow();
+        autoOptimizeDebounced();
+      });
+    }
+    return row;
+  }
+
+  function collectItems() {
+    const items = []; const rowsMeta = [];
+    const rows = rowsEl.querySelectorAll('.optimizer-row');
+    const mode = getOptimizeMode();
+    rows.forEach(row => {
+      const nameInput = row.querySelector('.skill-name');
+      const costEl = row.querySelector('.cost');
+      const hintEl = row.querySelector('.hint-level');
+      const requiredEl = row.querySelector('.required-skill');
+      if (!nameInput || !costEl) return;
+      const name = (nameInput.value || '').trim();
+      const rawCost = parseInt(costEl.value, 10);
+      const hintLevel = parseInt(hintEl?.value || '', 10) || 0;
+      const required = !!requiredEl?.checked;
+      const baseCostStored = row.dataset.baseCost ? parseInt(row.dataset.baseCost, 10) : NaN;
+      const cost = !isNaN(rawCost)
+        ? rawCost
+        : (!isNaN(baseCostStored) ? calculateDiscountedCost(baseCostStored, hintLevel) : NaN);
+      if (!name || isNaN(cost)) return;
+      const skill = findSkillByName(name);
+      if (!skill) return;
+      const category = skill.category || '';
+      const parentGoldId = row.dataset.parentGoldId || '';
+      const isLowerForGold = !!parentGoldId; // This row is a lower skill linked to a gold
+
+      // Always calculate both scores
+      const ratingScore = evaluateSkillScore(skill);
+      const aptitudeScore = getAptitudeTestScore(category, isLowerForGold);
+
+      // For optimization: in aptitude mode, use combined score (aptitude * large multiplier + rating as tiebreaker)
+      // This ensures aptitude is maximized first, then rating among equal aptitude options
+      const score = mode === 'aptitude-test'
+        ? (aptitudeScore * 100000) + ratingScore  // Aptitude primary, rating secondary
+        : ratingScore;
+
+      const rowId = row.dataset.rowId || Math.random().toString(36).slice(2);
+      const lowerRowId = row.dataset.lowerRowId || '';
+      const parentSkillIds = Array.isArray(skill.parentIds) && skill.parentIds.length ? skill.parentIds : [];
+      const lowerSkillId = skill.lowerSkillId || '';
+      const skillId = skill.skillId || skill.id || '';
+      items.push({
+        id: rowId, name: skill.name, cost, score,
+        ratingScore, aptitudeScore, // Track both scores
+        baseCost: baseCostStored, category, parentGoldId, lowerRowId,
+        checkType: skill.checkType || '', parentSkillIds, lowerSkillId, skillId, hintLevel, required
+      });
+      rowsMeta.push({ id: rowId, category, parentGoldId, lowerRowId });
+    });
+    return { items, rowsMeta };
+  }
+
+  function buildGroups(items, rowsMeta) {
+    const idToIndex = new Map(items.map((it, i) => [it.id, i]));
+    const skillIdToIndex = new Map();
+    items.forEach((it, i) => {
+      if (it.skillId) skillIdToIndex.set(String(it.skillId), i);
+      if (it.lowerSkillId) skillIdToIndex.set(String(it.lowerSkillId), i);
+    });
+    const used = new Array(items.length).fill(false);
+    const groups = [];
+    for (let i = 0; i < items.length; i++) {
+      if (used[i]) continue;
+      const it = items[i];
+      let handled = false;
+
+      // Dependency: if item has a parent (single-circle) present, offer choices (none, parent only, parent+child).
+      const parentCandidates = [];
+      if (Array.isArray(it.parentSkillIds) && it.parentSkillIds.length) parentCandidates.push(...it.parentSkillIds);
+      if (it.lowerSkillId) parentCandidates.push(it.lowerSkillId);
+      const pid = parentCandidates.find(pid => skillIdToIndex.has(String(pid)));
+      if (pid !== undefined) {
+        const j = skillIdToIndex.get(String(pid));
+        if (!used[j]) {
+          const parent = items[j];
+          const childIsGold = isGoldCategory(it.category);
+          const parentId = parent.id;
+          const parentMatchesLower = it.lowerRowId && it.lowerRowId === parentId;
+          const comboCost = (childIsGold && parentMatchesLower) ? it.cost : parent.cost + it.cost;
+          groups.push([
+            { none: true, items: [] },
+            { pick: j, cost: parent.cost, score: parent.score,
+              ratingScore: parent.ratingScore || 0, aptitudeScore: parent.aptitudeScore || 0, items: [j] },
+            // Upgraded (double-circle): pay both costs, only upgraded score counts.
+            // For aptitude: gold skill gets full aptitude, lower doesn't count
+            { combo: [j, i], cost: comboCost, score: it.score,
+              ratingScore: it.ratingScore || 0, aptitudeScore: it.aptitudeScore || 0, items: [j, i] }
+          ]);
+          used[j] = used[i] = true;
+          handled = true;
+        }
+      }
+      if (handled) continue;
+
+      const isGold = isGoldCategory(it.category);
+      if (isGold && it.lowerRowId && idToIndex.has(it.lowerRowId)) {
+        const j = idToIndex.get(it.lowerRowId);
+        if (!used[j]) {
+          // gold requires lower: offer none, lower only, or gold with lower cost included
+          // For aptitude: lower skill alone counts, gold combo only counts the gold
+          groups.push([
+            { none: true, items: [] },
+            { pick: j, cost: items[j].cost, score: items[j].score,
+              ratingScore: items[j].ratingScore || 0, aptitudeScore: items[j].aptitudeScore || 0, items: [j] },
+            { combo: [j, i], cost: it.cost, score: it.score,
+              ratingScore: it.ratingScore || 0, aptitudeScore: it.aptitudeScore || 0, items: [j, i] }
+          ]);
+          used[i] = used[j] = true;
+          continue;
+        }
+      }
+      // If this is a lower-linked row, and its parent gold appears later, it will be grouped there.
+      groups.push([
+        { none: true, items: [] },
+        { pick: i, cost: it.cost, score: it.score,
+          ratingScore: it.ratingScore || 0, aptitudeScore: it.aptitudeScore || 0, items: [i] }
+      ]);
+      used[i] = true;
+    }
+    return groups;
+  }
+
+  function optimizeGrouped(groups, items, budget) {
+    const B = Math.max(0, Math.floor(budget));
+    const requiredSet = new Set();
+    items.forEach((it, idx) => { if (it.required) requiredSet.add(idx); });
+    const filteredGroups = groups.map(opts => {
+      const reqInGroup = new Set();
+      opts.forEach(o => {
+        (o.items || []).forEach(idx => {
+          if (requiredSet.has(idx)) reqInGroup.add(idx);
+        });
+      });
+      if (!reqInGroup.size) return opts;
+      return opts.filter(o => {
+        const present = o.items || [];
+        for (const reqIdx of reqInGroup) {
+          if (!present.includes(reqIdx)) return false;
+        }
+        return true;
+      });
+    });
+    if (filteredGroups.some(opts => !opts.length)) {
+      return { best: 0, chosen: [], used: 0, error: 'required_unreachable' };
+    }
+    const G = filteredGroups.length;
+    const NEG = -1e15;
+    // Performance optimization: use rolling array for dp (only need prev and curr rows)
+    // This reduces memory from O(G × B) to O(2 × B) for dp array
+    let dpPrev = new Array(B + 1).fill(0); // dp[0] starts at 0
+    let dpCurr = new Array(B + 1).fill(NEG);
+    // We still need full choice array for reconstruction
+    const choice = Array.from({ length: G + 1 }, () => new Array(B + 1).fill(-1));
+    for (let g = 1; g <= G; g++) {
+      const opts = filteredGroups[g - 1];
+      const hasNone = opts.some(o => o.none);
+      for (let b = 0; b <= B; b++) {
+        if (hasNone) {
+          dpCurr[b] = dpPrev[b];
+          choice[g][b] = -1;
+        } else {
+          dpCurr[b] = NEG;
+          choice[g][b] = -1;
+        }
+        for (let k = 0; k < opts.length; k++) {
+          const o = opts[k]; if (o.none) continue;
+          const w = Math.max(0, Math.floor(o.cost)); const v = Math.max(0, Math.floor(o.score));
+          if (w <= b && dpPrev[b - w] > NEG / 2) {
+            const cand = dpPrev[b - w] + v;
+            if (cand > dpCurr[b]) { dpCurr[b] = cand; choice[g][b] = k; }
+          }
+        }
+      }
+      // Swap arrays for next iteration
+      const temp = dpPrev;
+      dpPrev = dpCurr;
+      dpCurr = temp;
+      dpCurr.fill(NEG); // Reset for next iteration
+    }
+    // After loop, dpPrev contains dp[G]
+    if (dpPrev[B] <= NEG / 2) {
+      return { best: 0, chosen: [], used: 0, error: 'required_unreachable' };
+    }
+    // reconstruct
+    let b = B; const chosen = [];
+    for (let g = G; g >= 1; g--) {
+      const opts = filteredGroups[g - 1];
+      const k = choice[g][b];
+      if (k > 0) {
+        const o = opts[k];
+        const picks = o.combo || (typeof o.pick === 'number' ? [o.pick] : []);
+        if (o.combo) {
+          const lastIdx = picks[picks.length - 1];
+          const baseItem = items[lastIdx];
+          chosen.push({
+            ...baseItem,
+            id: baseItem.id,
+            cost: o.cost,
+            score: o.score,
+            combo: true,
+            components: picks.map(idx => items[idx]?.id).filter(Boolean)
+          });
+          const comboParentName = baseItem.name;
+          picks.slice(0, -1).forEach(idx => {
+            const comp = items[idx];
+            if (!comp) return;
+            chosen.push({
+              ...comp,
+              cost: 0,
+              score: 0,
+              comboComponent: true,
+              comboParentName
+            });
+          });
+        } else {
+          picks.forEach(idx => chosen.push(items[idx]));
+        }
+        b -= Math.max(0, Math.floor(o.cost));
+      }
+    }
+    chosen.reverse();
+    const idToIndex = new Map(items.map((it, idx) => [it.id, idx]));
+    const chosenIds = new Set(chosen.map(it => it.id));
+    let addedScore = 0;
+    let addedCost = 0;
+    requiredSet.forEach(idx => {
+      const it = items[idx];
+      if (!it || chosenIds.has(it.id)) return;
+      chosen.push({ ...it, forced: true });
+      chosenIds.add(it.id);
+      addedScore += Math.max(0, Math.floor(it.score || 0));
+      addedCost += Math.max(0, Math.floor(it.cost || 0));
+      if (it.lowerRowId && idToIndex.has(it.lowerRowId)) {
+        const lower = items[idToIndex.get(it.lowerRowId)];
+        if (lower && !chosenIds.has(lower.id)) {
+          chosen.push({ ...lower, forced: true });
+          chosenIds.add(lower.id);
+          addedScore += Math.max(0, Math.floor(lower.score || 0));
+          addedCost += Math.max(0, Math.floor(lower.cost || 0));
+        }
+      }
+    });
+    const used = chosen.reduce((sum, it) => it.comboComponent ? sum : sum + Math.max(0, Math.floor(it.cost)), 0);
+    const best = dpPrev[B] + addedScore;
+    if (used > B) {
+      return { best: 0, chosen: [], used: 0, error: 'required_unreachable' };
+    }
+    return { best, chosen, used };
+  }
+
+  function expandRequired(items) {
+    const idToIndex = new Map(items.map((it, idx) => [it.id, idx]));
+    const skillIdToIndex = new Map();
+    const parentGoldToChild = new Map();
+    items.forEach((it, idx) => {
+      if (it.skillId !== undefined && it.skillId !== null) {
+        skillIdToIndex.set(String(it.skillId), idx);
+      }
+      if (it.parentGoldId) {
+        parentGoldToChild.set(it.parentGoldId, idx);
+      }
+    });
+    const requiredIds = new Set(items.filter(it => it.required).map(it => it.id));
+    let changed = true;
+    while (changed) {
+      changed = false;
+      Array.from(requiredIds).forEach(id => {
+        const idx = idToIndex.get(id);
+        if (idx === undefined) return;
+        const it = items[idx];
+        if (it.lowerRowId && idToIndex.has(it.lowerRowId) && !requiredIds.has(it.lowerRowId)) {
+          requiredIds.add(it.lowerRowId);
+          changed = true;
+        }
+        if (it.lowerSkillId !== undefined && it.lowerSkillId !== null) {
+          const lowerIdx = skillIdToIndex.get(String(it.lowerSkillId));
+          if (lowerIdx !== undefined) {
+            const lowerId = items[lowerIdx]?.id;
+            if (lowerId && !requiredIds.has(lowerId)) {
+              requiredIds.add(lowerId);
+              changed = true;
+            }
+          }
+        }
+        const parents = Array.isArray(it.parentSkillIds) ? it.parentSkillIds : [];
+        parents.forEach(pid => {
+          const pidx = skillIdToIndex.get(String(pid));
+          if (pidx === undefined) return;
+          const pidId = items[pidx]?.id;
+          if (pidId && !requiredIds.has(pidId)) {
+            requiredIds.add(pidId);
+            changed = true;
+          }
+        });
+        if (it.id && parentGoldToChild.has(it.id)) {
+          const childIdx = parentGoldToChild.get(it.id);
+          const childId = items[childIdx]?.id;
+          if (childId && !requiredIds.has(childId)) {
+            requiredIds.add(childId);
+            changed = true;
+          }
+        }
+      });
+    }
+    const requiredItems = items.filter(it => requiredIds.has(it.id));
+    const requiredGoldIds = new Set(requiredItems.filter(it => isGoldCategory(it.category)).map(it => it.id));
+    const lowerIncludedIds = new Set();
+    requiredItems.forEach(it => {
+      if (!requiredGoldIds.has(it.id)) return;
+      if (it.lowerRowId && requiredIds.has(it.lowerRowId)) lowerIncludedIds.add(it.lowerRowId);
+      if (it.lowerSkillId !== undefined && it.lowerSkillId !== null) {
+        const lowerIdx = skillIdToIndex.get(String(it.lowerSkillId));
+        if (lowerIdx !== undefined) {
+          const lowerId = items[lowerIdx]?.id;
+          if (lowerId && requiredIds.has(lowerId)) lowerIncludedIds.add(lowerId);
+        }
+      }
+      if (it.id && parentGoldToChild.has(it.id)) {
+        const childIdx = parentGoldToChild.get(it.id);
+        const childId = items[childIdx]?.id;
+        if (childId && requiredIds.has(childId)) lowerIncludedIds.add(childId);
+      }
+    });
+    const requiredCost = requiredItems.reduce((sum, it) => {
+      if (lowerIncludedIds.has(it.id)) return sum;
+      return sum + Math.max(0, Math.floor(it.cost));
+    }, 0);
+    const requiredScore = requiredItems.reduce((sum, it) => {
+      if (lowerIncludedIds.has(it.id)) return sum;
+      return sum + Math.max(0, Math.floor(it.score));
+    }, 0);
+    return { requiredIds, requiredItems, requiredCost, requiredScore };
+  }
+
+  function renderResults(result, budget) {
+    resultsEl.hidden = false;
+    usedPointsEl.textContent = String(result.used);
+    totalPointsEl.textContent = String(budget);
+    remainingPointsEl.textContent = String(Math.max(0, budget - result.used));
+    selectedListEl.innerHTML = '';
+
+    const mode = getOptimizeMode();
+    const chosen = Array.isArray(result.chosen) ? result.chosen : [];
+
+    // Calculate actual rating and aptitude scores from chosen items
+    // For aptitude: don't count lower skills that are part of gold combos
+    let totalRatingScore = 0;
+    let totalAptitudeScore = 0;
+    const lowerIdsInGoldCombos = new Set();
+    const chosenById = new Map(chosen.map(it => [it.id, it]));
+    const chosenBySkillId = new Map();
+    chosen.forEach(it => {
+      if (it.skillId !== undefined && it.skillId !== null) {
+        chosenBySkillId.set(String(it.skillId), it);
+      }
+    });
+
+    // First pass: identify lower skills that are part of gold combos
+    chosen.forEach(it => {
+      if (!isGoldCategory(it.category)) return;
+      if (it.lowerRowId && chosenById.has(it.lowerRowId)) {
+        lowerIdsInGoldCombos.add(it.lowerRowId);
+      }
+      if (it.lowerSkillId !== undefined && it.lowerSkillId !== null) {
+        const lower = chosenBySkillId.get(String(it.lowerSkillId));
+        if (lower) lowerIdsInGoldCombos.add(lower.id);
+      }
+    });
+    chosen.forEach(it => {
+      if (it.parentGoldId && chosenById.has(it.parentGoldId)) {
+        lowerIdsInGoldCombos.add(it.id);
+      }
+    });
+
+    // Second pass: calculate scores
+    // Lower skills in gold combos don't count (gold score includes the upgrade)
+    chosen.forEach(it => {
+      if (!it.comboComponent && !lowerIdsInGoldCombos.has(it.id)) {
+        totalRatingScore += it.ratingScore || 0;
+        totalAptitudeScore += it.aptitudeScore || 0;
+      }
+    });
+
+    // Display the appropriate score in "Best Score"
+    if (mode === 'aptitude-test') {
+      // In aptitude mode, show rating score as best (aptitude shown separately)
+      bestScoreEl.textContent = String(totalRatingScore);
+    } else {
+      bestScoreEl.textContent = String(totalRatingScore);
+    }
+
+    // Show/hide aptitude test score based on mode
+    if (aptitudeScorePill && aptitudeScoreEl) {
+      if (mode === 'aptitude-test') {
+        aptitudeScorePill.style.display = '';
+        aptitudeScoreEl.textContent = String(totalAptitudeScore);
+      } else {
+        aptitudeScorePill.style.display = 'none';
+      }
+    }
+
+    if (result.error === 'required_unreachable') {
+      const li = document.createElement('li');
+      li.className = 'result-item';
+      li.textContent = 'Required skills cannot fit within the current budget.';
+      selectedListEl.appendChild(li);
+      ratingEngine.updateRatingDisplay(0);
+      return;
+    }
+    const ordered = [...chosen];
+    const indexMap = new Map(ordered.map((it, idx) => [it.id, idx]));
+    const byId = new Map(ordered.map(it => [it.id, it]));
+    const bySkillId = new Map();
+    ordered.forEach(it => {
+      if (it.skillId !== undefined && it.skillId !== null) {
+        bySkillId.set(String(it.skillId), it);
+      }
+    });
+    const lowerToGold = new Map();
+    const goldToLower = new Map();
+    ordered.forEach(it => {
+      if (!isGoldCategory(it.category)) return;
+      if (it.lowerRowId && byId.has(it.lowerRowId)) {
+        lowerToGold.set(it.lowerRowId, it);
+        goldToLower.set(it.id, byId.get(it.lowerRowId));
+        return;
+      }
+      if (it.lowerSkillId !== undefined && it.lowerSkillId !== null) {
+        const lower = bySkillId.get(String(it.lowerSkillId));
+        if (lower) {
+          lowerToGold.set(lower.id, it);
+          goldToLower.set(it.id, lower);
+        }
+      }
+    });
+    ordered.sort((a, b) => {
+      const ag = lowerToGold.get(a.id);
+      const bg = lowerToGold.get(b.id);
+      if (ag && ag.id === b.id) return 1;
+      if (bg && bg.id === a.id) return -1;
+      return (indexMap.get(a.id) || 0) - (indexMap.get(b.id) || 0);
+    });
+      ordered.forEach(it => {
+        const li = document.createElement('li');
+        li.className = 'result-item';
+        const cat = it.category || 'unknown';
+        const canon = (function(v){ v=(v||'').toLowerCase(); if(v.includes('gold')) return 'gold'; if(v==='ius'||v.includes('ius')) return 'ius'; return v; })(cat);
+        if (canon) li.classList.add(`cat-${canon}`);
+        const baseCategory = getBaseCategoryForResult(it);
+        if (baseCategory) li.dataset.baseCategory = baseCategory;
+        const includedWith = it.comboComponent
+          ? it.comboParentName
+          : (lowerToGold.has(it.id) ? lowerToGold.get(it.id)?.name : '');
+      // Show rating score in the meta, not the combined optimization score
+      const displayScore = it.ratingScore !== undefined ? it.ratingScore : it.score;
+      const meta = includedWith
+        ? `- included with ${includedWith}`
+        : `- cost ${it.cost}, score ${displayScore}`;
+      li.innerHTML = `<span class="res-name">${it.name}</span> <span class="res-meta">${meta}</span>`;
+      selectedListEl.appendChild(li);
+    });
+    // Always use the rating score for the rating display
+    ratingEngine.updateRatingDisplay(totalRatingScore);
+  }
+
+  // persistence
+  function saveState() {
+    const state = { budget: parseInt(budgetInput.value, 10) || 0, cfg: {}, rows: [], autoTargets: [], rating: ratingEngine.readRatingState(), fastLearner: !!fastLearnerToggle?.checked, optimizeMode: getOptimizeMode() };
+    Object.entries(cfg).forEach(([k, el]) => { state.cfg[k] = el ? el.value : 'A'; });
+    if (autoTargetInputs && autoTargetInputs.length) {
+      state.autoTargets = Array.from(autoTargetInputs)
+        .filter(input => input.checked)
+        .map(input => input.value);
+    }
+    const rows = rowsEl.querySelectorAll('.optimizer-row');
+    rows.forEach(row => {
+      const nameInput = row.querySelector('.skill-name');
+      const costEl = row.querySelector('.cost');
+      const hintEl = row.querySelector('.hint-level');
+      const requiredEl = row.querySelector('.required-skill');
+      if (!nameInput || !costEl) return;
+      state.rows.push({
+        id: row.dataset.rowId || '',
+        category: row.dataset.skillCategory || '',
+        name: nameInput.value || '',
+        cost: parseInt(costEl.value, 10) || 0,
+        hintLevel: parseInt(hintEl?.value, 10) || 0,
+        required: !!requiredEl?.checked,
+        baseCost: row.dataset.baseCost || '',
+        parentGoldId: row.dataset.parentGoldId || '',
+        lowerRowId: row.dataset.lowerRowId || ''
+      });
+    });
+    try { localStorage.setItem('optimizerState', JSON.stringify(state)); } catch {}
+  }
+
+  function loadState() {
+    try {
+      const raw = localStorage.getItem('optimizerState'); if (!raw) return false;
+      const state = JSON.parse(raw); if (!state || !Array.isArray(state.rows)) return false;
+      budgetInput.value = state.budget || 0;
+      if (fastLearnerToggle) fastLearnerToggle.checked = !!state.fastLearner;
+      if (optimizeModeSelect && state.optimizeMode) optimizeModeSelect.value = state.optimizeMode;
+      Object.entries(state.cfg || {}).forEach(([k, v]) => { if (cfg[k]) cfg[k].value = v; });
+      if (Array.isArray(state.autoTargets) && state.autoTargets.length) {
+        setAutoTargetSelections(state.autoTargets);
+      } else {
+        setAutoTargetSelections(null);
+      }
+      if (state.rating) {
+        ratingEngine.applyRatingState(state.rating);
+        ratingEngine.updateRatingDisplay();
+      } else {
+        ratingEngine.updateRatingDisplay();
+      }
+      Array.from(rowsEl.querySelectorAll('.optimizer-row')).forEach(n => n.remove());
+      const created = new Map();
+      let createdAny = false;
+      state.rows.forEach(r => {
+        const row = makeRow(); rowsEl.appendChild(row);
+        createdAny = true;
+        if (r.id) row.dataset.rowId = r.id;
+        if (r.parentGoldId) {
+          row.dataset.parentGoldId = r.parentGoldId;
+          row.classList.add('linked-lower');
+          const linkedInput = row.querySelector('.skill-name');
+          if (linkedInput) linkedInput.placeholder = 'Lower skill...';
+        }
+        const skillInput = row.querySelector('.skill-name');
+        if (skillInput) skillInput.value = r.name || '';
+        const costEl = row.querySelector('.cost');
+        if (costEl) costEl.value = typeof r.cost === 'number' && !isNaN(r.cost) ? r.cost : 0;
+        const hintEl = row.querySelector('.hint-level');
+        if (hintEl) hintEl.value = typeof r.hintLevel === 'number' && !isNaN(r.hintLevel) ? r.hintLevel : 0;
+        const requiredEl = row.querySelector('.required-skill');
+        if (requiredEl) {
+          requiredEl.checked = !!r.required;
+          row.classList.toggle('required', !!r.required);
+        }
+        if (r.baseCost) row.dataset.baseCost = r.baseCost; else delete row.dataset.baseCost;
+        if (r.category) row.dataset.skillCategory = r.category;
+        if (typeof row.syncSkillCategory === 'function') {
+          row.syncSkillCategory({ triggerOptimize: false, allowLinking: false, updateCost: true });
+        } else {
+          applyCategoryAccent(row, r.category || '');
+        }
+        created.set(row.dataset.rowId, row);
+      });
+      state.rows.forEach(r => {
+        if (r.parentGoldId && created.has(r.parentGoldId)) {
+          const parent = created.get(r.parentGoldId);
+          parent.dataset.lowerRowId = r.id || '';
+          const child = created.get(r.id);
+          if (child && child.previousSibling !== parent) {
+            rowsEl.removeChild(child);
+            rowsEl.insertBefore(child, parent.nextSibling);
+          }
+        }
+      });
+      if (!createdAny) return false;
+      updateHintOptionLabels();
+      refreshAllRowCosts();
+      saveState();
+      return true;
+    } catch { return false; }
+  }
+
+  // events
+  if (addRowBtn) addRowBtn.addEventListener('click', () => {
+    const newRow = makeRow();
+    rowsEl.appendChild(newRow);
+    scrollRowIntoView(newRow);
+    saveState();
+  });
+
+  if (optimizeBtn) optimizeBtn.addEventListener('click', () => {
+    const budget = parseInt(budgetInput.value, 10); if (isNaN(budget) || budget < 0) { alert('Please enter a valid skill points budget.'); return; }
+    const { items, rowsMeta } = collectItems(); if (!items.length) { alert('Add at least one skill with a valid cost.'); return; }
+    const requiredSummary = expandRequired(items);
+    if (requiredSummary.requiredCost > budget) {
+      renderResults({ best: 0, chosen: [], used: 0, error: 'required_unreachable' }, budget);
+      saveState();
+      return;
+    }
+    const optionalItems = items.filter(it => !requiredSummary.requiredIds.has(it.id));
+    const groups = buildGroups(optionalItems, rowsMeta);
+    const result = optimizeGrouped(groups, optionalItems, budget - requiredSummary.requiredCost);
+    const mergedResult = {
+      ...result,
+      chosen: requiredSummary.requiredItems.concat(result.chosen),
+      used: result.used + requiredSummary.requiredCost,
+      best: result.best + requiredSummary.requiredScore
+    };
+    renderResults(mergedResult, budget); saveState();
+  });
+  if (clearAllBtn) clearAllBtn.addEventListener('click', () => { clearAllRows(); });
+  if (shareBuildBtn) {
+    shareBuildBtn.addEventListener('click', async () => {
+      const data = serializeRows();
+      if (!data) { setAutoStatus('No build to share.', true); return; }
+      try {
+        writeToURL();
+        const shareURL = location.href;
+        let copied = false;
+        try {
+          copied = await tryWriteClipboard(shareURL);
+        } catch (err) {
+          console.warn('Clipboard API write failed', err);
+        }
+        if (!copied) {
+          await copyViaFallback(shareURL);
+        }
+        setAutoStatus('Shareable link copied to clipboard!');
+      } catch (err) {
+        console.error('Share failed', err);
+        alert('Unable to copy shareable link. Copy the URL from the address bar.');
+      }
+    });
+  }
+  if (saveBuildBtn) {
+    saveBuildBtn.addEventListener('click', () => {
+      const buildData = serializeRows();
+      if (!buildData) {
+        setAutoStatus('No build to save.', true);
+        return;
+      }
+      saveBuildNameInput.value = '';
+      saveBuildDescInput.value = '';
+      openModal(saveBuildModal);
+      if (saveBuildNameInput && saveBuildNameInput.focus) {
+        saveBuildNameInput.focus({ preventScroll: true });
+      }
+    });
+  }
+
+  if (viewBuildsBtn) {
+    viewBuildsBtn.addEventListener('click', () => {
+      renderBuildsList();
+      openModal(buildsListModal);
+    });
+  }
+
+  let activeModal = null;
+  let lastFocusedEl = null;
+  let modalRoot = null;
+  let scrollLockY = 0;
+
+  function getModalRoot() {
+    if (modalRoot && document.body.contains(modalRoot)) return modalRoot;
+    modalRoot = document.getElementById('modal-root');
+    if (!modalRoot) {
+      modalRoot = document.createElement('div');
+      modalRoot.id = 'modal-root';
+      document.body.appendChild(modalRoot);
+    }
+    return modalRoot;
+  }
+
+  function getFocusableWithin(root) {
+    if (!root) return [];
+    const nodes = root.querySelectorAll(
+      'a[href], button:not([disabled]), textarea, input, select, [tabindex]:not([tabindex="-1"])'
+    );
+    return Array.from(nodes).filter((el) => !el.hasAttribute('disabled') && el.offsetParent !== null);
+  }
+
+  function handleModalKeydown(e) {
+    if (!activeModal) return;
+    if (e.key === 'Escape') {
+      closeModal(activeModal);
+      return;
+    }
+    if (e.key !== 'Tab') return;
+    const focusable = getFocusableWithin(activeModal);
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  }
+
+  function attachModalToRoot(modalEl) {
+    const root = getModalRoot();
+    if (modalEl && modalEl.parentElement !== root) {
+      root.appendChild(modalEl);
+    }
+  }
+
+  function openModal(modalEl) {
+    if (!modalEl) return;
+    attachModalToRoot(modalEl);
+    lastFocusedEl = document.activeElement;
+    activeModal = modalEl;
+    modalEl.style.display = 'flex';
+    modalEl.classList.add('open');
+    modalEl.setAttribute('aria-hidden', 'false');
+    if (!document.body.classList.contains('modal-open')) {
+      scrollLockY = window.scrollY || window.pageYOffset || 0;
+      document.body.style.position = 'fixed';
+      document.body.style.top = `-${scrollLockY}px`;
+      document.body.style.left = '0';
+      document.body.style.right = '0';
+      document.body.style.width = '100%';
+    }
+    document.body.classList.add('modal-open');
+    document.addEventListener('keydown', handleModalKeydown);
+    const focusable = getFocusableWithin(modalEl);
+    if (focusable.length) {
+      focusable[0].focus({ preventScroll: true });
+    }
+  }
+
+  function closeModal(modalEl) {
+    if (!modalEl) return;
+    modalEl.classList.remove('open');
+    modalEl.setAttribute('aria-hidden', 'true');
+    modalEl.style.display = 'none';
+    document.body.classList.remove('modal-open');
+    document.body.style.position = '';
+    document.body.style.top = '';
+    document.body.style.left = '';
+    document.body.style.right = '';
+    document.body.style.width = '';
+    window.scrollTo(0, scrollLockY);
+    document.removeEventListener('keydown', handleModalKeydown);
+    activeModal = null;
+    if (lastFocusedEl && lastFocusedEl.focus) {
+      lastFocusedEl.focus({ preventScroll: true });
+    }
+    lastFocusedEl = null;
+  }
+
+  function closeSaveBuildModal() {
+    closeModal(saveBuildModal);
+  }
+
+  function closeBuildsListModal() {
+    closeModal(buildsListModal);
+  }
+
+  function formatTimestamp(timestamp) {
+    const date = new Date(timestamp);
+    return date.toLocaleString(undefined, {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+  }
+
+  function getSavedBuilds() {
+    try {
+      const stored = localStorage.getItem('umatools-saved-builds');
+      if (stored) {
+        const builds = JSON.parse(stored);
+        if (Array.isArray(builds)) {
+          const validated = builds.filter(b => {
+            return b &&
+              typeof b === 'object' &&
+              b.id &&
+              b.name &&
+              b.data &&
+              typeof b.timestamp === 'number';
+          });
+          return validated.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+        }
+      }
+    } catch (err) {
+      console.error('Failed to load saved builds', err);
+      try {
+        localStorage.removeItem('umatools-saved-builds');
+      } catch {}
+    }
+    return [];
+  }
+
+  function deleteBuild(buildId) {
+    try {
+      let builds = getSavedBuilds();
+      builds = builds.filter(b => b.id !== buildId);
+      localStorage.setItem('umatools-saved-builds', JSON.stringify(builds));
+      return true;
+    } catch (err) {
+      console.error('Failed to delete build', err);
+      return false;
+    }
+  }
+
+  function loadBuildFromSaved(build) {
+    if (!build || !build.data) {
+      alert('Invalid build data.');
+      return;
+    }
+    try {
+      loadRowsFromString(build.data);
+      if (build.budget !== undefined) budgetInput.value = build.budget;
+      if (build.fastLearner !== undefined && fastLearnerToggle) {
+        fastLearnerToggle.checked = build.fastLearner;
+      }
+      if (build.optimizeMode !== undefined && optimizeModeSelect) {
+        optimizeModeSelect.value = build.optimizeMode;
+      }
+      if (build.config) {
+        Object.entries(build.config).forEach(([k, v]) => {
+          if (cfg[k]) cfg[k].value = v;
+        });
+      }
+      if (Array.isArray(build.autoTargets)) {
+        setAutoTargetSelections(build.autoTargets);
+      }
+      if (build.rating) {
+        ratingEngine.applyRatingState(build.rating);
+        ratingEngine.updateRatingDisplay();
+      } else {
+        ratingEngine.updateRatingDisplay();
+      }
+      updateAffinityStyles();
+      updateHintOptionLabels();
+      refreshAllRowCosts();
+      saveState();
+      autoOptimizeDebounced();
+      setAutoStatus(`Build "${build.name}" loaded successfully!`);
+      closeBuildsListModal();
+    } catch (err) {
+      console.error('Failed to load build', err);
+      alert('Failed to load build data.');
+    }
+  }
+
+  async function shareBuildFromSaved(build) {
+    if (!build || !build.data) {
+      alert('Invalid build data.');
+      return;
+    }
+    try {
+      const encoded = encodeBuildToURL(build.data);
+      if (!encoded) {
+        alert('Failed to encode build data.');
+        return;
+      }
+
+      const p = new URLSearchParams();
+      p.set('b', encoded);
+
+      if (build.budget) p.set('k', String(build.budget));
+      if (build.fastLearner) p.set('f', '1');
+      if (build.optimizeMode && build.optimizeMode !== 'rating') {
+        p.set('m', build.optimizeMode);
+      }
+
+      if (build.config) {
+        const cfgKeys = ['turf', 'dirt', 'sprint', 'mile', 'medium', 'long', 'front', 'pace', 'late', 'end'];
+        const cfgValues = cfgKeys.map(k => build.config[k] || 'A');
+        const cfgString = cfgValues.join(',');
+        if (cfgString && cfgString !== 'A,A,A,A,A,A,A,A,A,A') {
+          p.set('c', cfgString);
+        }
+      }
+      if (build.rating) {
+        p.set('r', encodeURIComponent(JSON.stringify(build.rating)));
+      }
+      if (Array.isArray(build.autoTargets) && build.autoTargets.length) {
+        p.set('t', build.autoTargets.join(','));
+      }
+
+      const shareURL = `${window.location.origin}${window.location.pathname}#${p.toString()}`;
+      let copied = false;
+      try {
+        copied = await tryWriteClipboard(shareURL);
+      } catch (err) {
+        console.warn('Clipboard API write failed', err);
+      }
+      if (!copied) {
+        await copyViaFallback(shareURL);
+      }
+      setAutoStatus(`Link for "${build.name}" copied to clipboard!`);
+    } catch (err) {
+      console.error('Share failed', err);
+      alert('Failed to create shareable link.');
+    }
+  }
+
+  function renderBuildsList() {
+    if (!buildsListContainer) return;
+    buildsListContainer.innerHTML = '';
+    const builds = getSavedBuilds();
+    if (builds.length === 0) {
+      buildsListContainer.innerHTML = '<div class="empty-builds">No saved builds yet. Save your current build to get started!</div>';
+      return;
+    }
+    builds.forEach(build => {
+      const item = document.createElement('div');
+      item.className = 'build-item';
+      const header = document.createElement('div');
+      header.className = 'build-item-header';
+      const titleDiv = document.createElement('div');
+      const title = document.createElement('h4');
+      title.className = 'build-item-title';
+      title.textContent = build.name || 'Untitled Build';
+      const timestamp = document.createElement('div');
+      timestamp.className = 'build-item-timestamp';
+      timestamp.textContent = formatTimestamp(build.timestamp);
+      titleDiv.appendChild(title);
+      titleDiv.appendChild(timestamp);
+      header.appendChild(titleDiv);
+      item.appendChild(header);
+      if (build.description) {
+        const desc = document.createElement('div');
+        desc.className = 'build-item-description';
+        desc.textContent = build.description;
+        item.appendChild(desc);
+      }
+      const meta = document.createElement('div');
+      meta.className = 'build-item-meta';
+      const metaParts = [];
+      if (build.budget) metaParts.push(`Budget: ${build.budget}`);
+      if (build.fastLearner) metaParts.push('Fast Learner');
+      if (build.optimizeMode) {
+        const modeLabel = build.optimizeMode === 'rating' ? 'Rating' : 'Aptitude Test';
+        metaParts.push(`Mode: ${modeLabel}`);
+      }
+      meta.textContent = metaParts.join(' • ');
+      item.appendChild(meta);
+      const actions = document.createElement('div');
+      actions.className = 'build-item-actions';
+      const loadBtn = document.createElement('button');
+      loadBtn.className = 'btn btn-secondary';
+      loadBtn.textContent = 'Load';
+      loadBtn.addEventListener('click', () => loadBuildFromSaved(build));
+      const shareBtn = document.createElement('button');
+      shareBtn.className = 'btn btn-secondary';
+      shareBtn.textContent = 'Share';
+      shareBtn.addEventListener('click', () => shareBuildFromSaved(build));
+      const deleteBtn = document.createElement('button');
+      deleteBtn.className = 'btn btn-secondary';
+      deleteBtn.textContent = 'Delete';
+      deleteBtn.style.color = 'var(--error-color, #d32f2f)';
+      deleteBtn.addEventListener('click', () => {
+        if (confirm(`Delete "${build.name}"? This cannot be undone.`)) {
+          if (deleteBuild(build.id)) {
+            renderBuildsList();
+            setAutoStatus(`Build "${build.name}" deleted.`);
+          } else {
+            alert('Failed to delete build.');
+          }
+        }
+      });
+      actions.appendChild(loadBtn);
+      actions.appendChild(shareBtn);
+      actions.appendChild(deleteBtn);
+      item.appendChild(actions);
+      buildsListContainer.appendChild(item);
+    });
+  }
+
+  if (saveModalClose) {
+    saveModalClose.addEventListener('click', closeSaveBuildModal);
+  }
+  if (saveModalCancel) {
+    saveModalCancel.addEventListener('click', closeSaveBuildModal);
+  }
+
+  if (saveBuildModal) {
+    saveBuildModal.addEventListener('click', (e) => {
+      if (e.target === saveBuildModal) closeSaveBuildModal();
+    });
+  }
+
+  if (buildsListModalClose) {
+    buildsListModalClose.addEventListener('click', closeBuildsListModal);
+  }
+  if (buildsListModalCloseBtn) {
+    buildsListModalCloseBtn.addEventListener('click', closeBuildsListModal);
+  }
+
+  if (buildsListModal) {
+    buildsListModal.addEventListener('click', (e) => {
+      if (e.target === buildsListModal) closeBuildsListModal();
+    });
+  }
+
+  if (saveModalSave) {
+    saveModalSave.addEventListener('click', () => {
+      const name = saveBuildNameInput?.value?.trim();
+      if (!name) {
+        alert('Please enter a build name.');
+        if (saveBuildNameInput && saveBuildNameInput.focus) {
+          saveBuildNameInput.focus({ preventScroll: true });
+        }
+        return;
+      }
+
+      const buildData = serializeRows();
+      if (!buildData) {
+        alert('No build data to save.');
+        return;
+      }
+
+      const description = saveBuildDescInput?.value?.trim() || '';
+      const build = {
+        id: Date.now().toString(),
+        name,
+        description,
+        data: buildData,
+        timestamp: Date.now(),
+        budget: budgetInput?.value || '0',
+        fastLearner: fastLearnerToggle?.checked || false,
+        optimizeMode: optimizeModeSelect?.value || 'rating',
+        rating: ratingEngine.readRatingState(),
+        autoTargets: (autoTargetInputs && autoTargetInputs.length)
+          ? Array.from(autoTargetInputs).filter(input => input.checked).map(input => input.value)
+          : [],
+        config: {
+          turf: cfg.turf?.value || 'A',
+          dirt: cfg.dirt?.value || 'G',
+          sprint: cfg.sprint?.value || 'D',
+          mile: cfg.mile?.value || 'C',
+          medium: cfg.medium?.value || 'A',
+          long: cfg.long?.value || 'B',
+          front: cfg.front?.value || 'A',
+          pace: cfg.pace?.value || 'B',
+          late: cfg.late?.value || 'C',
+          end: cfg.end?.value || 'B'
+        }
+      };
+
+      try {
+        let builds = getSavedBuilds();
+        builds.push(build);
+        builds.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+        const MAX_SAVED_BUILDS = 50;
+        if (builds.length > MAX_SAVED_BUILDS) {
+          builds = builds.slice(0, MAX_SAVED_BUILDS);
+        }
+        try {
+          localStorage.setItem('umatools-saved-builds', JSON.stringify(builds));
+          setAutoStatus(`Build "${name}" saved successfully!`);
+          closeSaveBuildModal();
+        } catch (storageErr) {
+          if (storageErr.name === 'QuotaExceededError' || storageErr.code === 22) {
+            if (builds.length > 10) {
+              builds = builds.slice(0, 10);
+              try {
+                localStorage.setItem('umatools-saved-builds', JSON.stringify(builds));
+                alert(`Storage limit reached. Kept only your 10 most recent builds. Build "${name}" saved.`);
+                closeSaveBuildModal();
+                return;
+              } catch {}
+            }
+            alert('Storage quota exceeded. Please delete some saved builds to make room.');
+          } else {
+            throw storageErr;
+          }
+        }
+      } catch (err) {
+        console.error('Failed to save build', err);
+        alert('Failed to save build. Your browser may have storage disabled or limits exceeded.');
+      }
+    });
+  }
+
+  if (autoBuildBtn) autoBuildBtn.addEventListener('click', autoBuildIdealSkills);
+  if (fastLearnerToggle) {
+    fastLearnerToggle.addEventListener('change', () => {
+      updateHintOptionLabels();
+      refreshAllRowCosts();
+      saveState();
+      autoOptimizeDebounced();
+    });
+  }
+  if (optimizeModeSelect) {
+    optimizeModeSelect.addEventListener('change', () => {
+      saveState();
+      autoOptimizeDebounced();
+    });
+  }
+
+  // CSV loader
+  const csvFileInput = document.getElementById('csv-file');
+  const loadCsvBtn = document.getElementById('load-csv');
+  if (loadCsvBtn && csvFileInput) {
+    loadCsvBtn.addEventListener('click', () => csvFileInput.click());
+    csvFileInput.addEventListener('change', () => { const file = csvFileInput.files && csvFileInput.files[0]; if (!file) return; const reader = new FileReader(); reader.onload = () => { const ok = loadFromCSVContent(reader.result || ''); if (!ok) alert('CSV not recognized. Expected headers like: skill_type,name,base/base_value,S_A/B_C/D_E_F/G or apt_1..apt_4,affinity'); saveState(); }; reader.readAsText(file); });
+  }
+
+  function initRatingFloat() {
+    const floatRoot = document.getElementById('rating-float');
+    const ratingHero = document.querySelector('.rating-hero');
+    if (!floatRoot || !ratingHero) return;
+
+    let heroState = 'visible';
+
+    if (floatRoot.parentElement !== document.body) {
+      document.body.appendChild(floatRoot);
+    }
+
+    const getHeroState = (rect) => {
+      if (!rect) return 'visible';
+      if (rect.bottom < 0) return 'above';
+      if (rect.top > window.innerHeight) return 'below';
+      return 'visible';
+    };
+
+    const updateVisibility = () => {
+      const shouldShow = heroState === 'above';
+      floatRoot.classList.toggle('is-visible', shouldShow);
+    };
+
+    if ('IntersectionObserver' in window) {
+      const observer = new IntersectionObserver(
+        (entries) => {
+          entries.forEach((entry) => {
+            if (entry.target === ratingHero) {
+              if (entry.isIntersecting) {
+                heroState = 'visible';
+              } else {
+                heroState = entry.boundingClientRect.top < 0 ? 'above' : 'below';
+              }
+              updateVisibility();
+            }
+          });
+        },
+        { threshold: 0.1 }
+      );
+      observer.observe(ratingHero);
+    } else {
+      const check = () => {
+        heroState = getHeroState(ratingHero.getBoundingClientRect());
+        updateVisibility();
+      };
+      check();
+      window.addEventListener('scroll', check, { passive: true });
+      window.addEventListener('resize', check);
+    }
+
+    heroState = getHeroState(ratingHero.getBoundingClientRect());
+    updateVisibility();
+  }
+
+  let ratingSpriteLoaded = false;
+  function scheduleRatingSpriteLoad() {
+    if (ratingSpriteLoaded) return;
+    const load = () => {
+      if (ratingSpriteLoaded) return;
+      ratingSpriteLoaded = true;
+      ratingEngine.loadRatingSprite();
+    };
+    const card = document.getElementById('rating-card');
+    if ('IntersectionObserver' in window && card) {
+      const observer = new IntersectionObserver((entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          observer.disconnect();
+          load();
+        }
+      }, { rootMargin: '200px' });
+      observer.observe(card);
+    }
+    if ('requestIdleCallback' in window) {
+      requestIdleCallback(load, { timeout: 2000 });
+    } else {
+      setTimeout(load, 1200);
+    }
+  }
+
+  function initTutorial() {
+    if (!window.UmaTutorial || !document.getElementById('tutorial-open')) return;
+    const tutorial = window.UmaTutorial.create({
+      pageKey: 'optimizer',
+      openButton: '#tutorial-open',
+      panelTitle: 'Optimizer quick tour',
+      getTokens: () => ({
+        goalLabel: optimizeModeSelect?.selectedOptions?.[0]?.textContent?.trim() || 'Rating'
+      }),
+      steps: [
+        {
+          title: 'Quick setup path',
+          shortTitle: 'Quick setup path',
+          text: 'This lightweight tour is skippable and re-openable any time from this Help / Tutorial button.',
+          target: '#tutorial-open'
+        },
+        {
+          title: 'Add your skill points',
+          shortTitle: 'Skill points',
+          text: 'Set your available skill points budget here. Recommendations and remaining points use this value.',
+          target: '#budget'
+        },
+        {
+          title: 'Use Fast Learner when needed',
+          shortTitle: 'Fast Learner toggle',
+          text: 'Turn this on if your Uma has reduced skill costs. Skill costs update automatically.',
+          target: '#fast-learner'
+        },
+        {
+          title: 'Optimize for {goalLabel}',
+          shortTitle: 'Optimize for goal',
+          text: 'Choose the selected goal or category. Current mode is {goalLabel}, and you can switch any time.',
+          target: '#optimize-mode'
+        },
+        {
+          title: 'Match race affinities',
+          shortTitle: 'Race configuration',
+          text: 'Set track, distance, and strategy to match your Uma. Affinities change how skills are scored.',
+          target: '#optimizer-race-config .race-config-pane'
+        },
+        {
+          title: 'Use the skill builder',
+          shortTitle: 'Skill builder',
+          text: 'Generate Build auto-picks strong rating skills for your selected categories, then you can fine-tune rows.',
+          target: '#optimizer-skill-builder'
+        },
+        {
+          title: 'Enter stats and star level',
+          shortTitle: 'Stats and stars',
+          text: 'Input final stats, star rarity, and unique level so projected rating matches your Uma.',
+          target: '#rating-card'
+        },
+        {
+          title: 'Add skills to the optimizer',
+          shortTitle: 'Add skills',
+          text: 'Type skills in these rows. Type and category are detected, and costs update with your settings.',
+          target: '#rows'
+        },
+        {
+          title: 'Find your Skills to Buy',
+          shortTitle: 'Skills to Buy',
+          text: 'Your recommended purchase list appears here once rows are filled. This is where to read final picks.',
+          target: '#skills-to-buy-section'
+        }
+      ]
+    });
+    tutorial.init();
+  }
+
+  function finishInit() {
+    const hadURL = readFromURL();
+    if (!hadURL) {
+      const had = loadState();
+      if (!had) {
+        rowsEl.appendChild(makeRow());
+      }
+    }
+    if (libStatus && /loading/i.test(libStatus.textContent || "")) {
+      libStatus.textContent = "Skill library ready.";
+    }
+    ratingEngine.initRatingInputs();
+    scheduleRatingSpriteLoad();
+    initRatingFloat();
+    updateAffinityStyles();
+    updateHintOptionLabels();
+    refreshAllRowCosts();
+    ensureOneEmptyRow();
+    autoOptimizeDebounced();
+    initTutorial();
+  }
+
+  // Init: prefer CSV by default
+  loadSkillCostsJSON()
+    .catch(err => { console.warn('Skill cost JSON load failed', err); })
+    .then(() => loadSkillsCSV())
+    .then(() => finishInit())
+    .catch(err => {
+      console.error('Initialization failed', err);
+      finishInit();
+    });
+  const persistIfRelevant = (e) => {
+    const t = e.target; if (!t) return;
+    if (t.closest('.race-config-container')) updateAffinityStyles();
+    if (t.closest('.auto-targets')) {
+      saveState();
+      clearAutoHighlights();
+      autoOptimizeDebounced();
+      return;
+    }
+    if (t.closest('.optimizer-row') || t.id === 'budget' || t.closest('.race-config-container')) {
+      saveState();
+      ensureOneEmptyRow();
+      clearAutoHighlights();
+      autoOptimizeDebounced();
+    }
+  };
+  document.addEventListener('change', persistIfRelevant);
+  document.addEventListener('input', persistIfRelevant);
+})();
