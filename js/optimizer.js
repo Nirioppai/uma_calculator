@@ -1789,7 +1789,18 @@
     row.cleanupSkillTracking = removeSkillKeyTracking;
     setCategoryDisplay(row.dataset.skillCategory || '');
     if (skillInput) {
-      const syncFromInput = () => syncSkillCategory({ triggerOptimize: true, updateCost: true });
+      const syncFromInput = () => {
+        // Auto-select when only one skill matches the typed text
+        const typed = (skillInput.value || '').trim();
+        if (typed && !findSkillByName(typed)) {
+          const lower = typed.toLowerCase();
+          const matches = allSkillNames.filter(n => n.toLowerCase().includes(lower));
+          if (matches.length === 1) {
+            skillInput.value = matches[0];
+          }
+        }
+        syncSkillCategory({ triggerOptimize: true, updateCost: true });
+      };
       skillInput.addEventListener('input', syncFromInput);
       skillInput.addEventListener('change', syncFromInput);
       skillInput.addEventListener('blur', syncFromInput);
