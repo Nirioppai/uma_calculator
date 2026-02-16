@@ -10,6 +10,7 @@
   const budgetInput = document.getElementById('budget');
   const fastLearnerToggle = document.getElementById('fast-learner');
   const optimizeModeSelect = document.getElementById('optimize-mode');
+  const skillSortSelect = document.getElementById('skill-sort');
   const libStatus = document.getElementById('lib-status');
   if (libStatus) libStatus.innerHTML = '<span class="loading-indicator">Loading skill library...</span>';
 
@@ -2294,11 +2295,17 @@
         }
       }
     });
+    const sortMode = skillSortSelect ? skillSortSelect.value : 'added';
     ordered.sort((a, b) => {
       const ag = lowerToGold.get(a.id);
       const bg = lowerToGold.get(b.id);
       if (ag && ag.id === b.id) return 1;
       if (bg && bg.id === a.id) return -1;
+      if (sortMode === 'score') {
+        const sa = a.ratingScore !== undefined ? a.ratingScore : a.score;
+        const sb = b.ratingScore !== undefined ? b.ratingScore : b.score;
+        return (sb || 0) - (sa || 0);
+      }
       return (indexMap.get(a.id) || 0) - (indexMap.get(b.id) || 0);
     });
       ordered.forEach(it => {
@@ -2326,7 +2333,7 @@
 
   // persistence
   function saveState() {
-    const state = { budget: parseInt(budgetInput.value, 10) || 0, cfg: {}, rows: [], autoTargets: [], rating: ratingEngine.readRatingState(), fastLearner: !!fastLearnerToggle?.checked, optimizeMode: getOptimizeMode() };
+    const state = { budget: parseInt(budgetInput.value, 10) || 0, cfg: {}, rows: [], autoTargets: [], rating: ratingEngine.readRatingState(), fastLearner: !!fastLearnerToggle?.checked, optimizeMode: getOptimizeMode(), skillSort: skillSortSelect ? skillSortSelect.value : 'added' };
     Object.entries(cfg).forEach(([k, el]) => { state.cfg[k] = el ? el.value : 'A'; });
     if (autoTargetInputs && autoTargetInputs.length) {
       state.autoTargets = Array.from(autoTargetInputs)
@@ -2362,6 +2369,7 @@
       budgetInput.value = state.budget || 0;
       if (fastLearnerToggle) fastLearnerToggle.checked = !!state.fastLearner;
       if (optimizeModeSelect && state.optimizeMode) optimizeModeSelect.value = state.optimizeMode;
+      if (skillSortSelect && state.skillSort) skillSortSelect.value = state.skillSort;
       Object.entries(state.cfg || {}).forEach(([k, v]) => { if (cfg[k]) cfg[k].value = v; });
       if (Array.isArray(state.autoTargets) && state.autoTargets.length) {
         setAutoTargetSelections(state.autoTargets);
@@ -2937,6 +2945,12 @@
   }
   if (optimizeModeSelect) {
     optimizeModeSelect.addEventListener('change', () => {
+      saveState();
+      autoOptimizeDebounced();
+    });
+  }
+  if (skillSortSelect) {
+    skillSortSelect.addEventListener('change', () => {
       saveState();
       autoOptimizeDebounced();
     });
