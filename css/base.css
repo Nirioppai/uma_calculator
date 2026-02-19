@@ -926,6 +926,24 @@ body.dark .cell.match {
   color: #1f2937;
   border-color: #cbd5e0;
 }
+.btn.btn-toggle-on {
+  border-color: #48bb78;
+  color: #276749;
+}
+.btn.btn-toggle-off {
+  border-color: #fc8181;
+  color: #9b2c2c;
+  opacity: 0.85;
+}
+body.dark .btn.btn-toggle-on {
+  border-color: #68d391;
+  color: #9ae6b4;
+}
+body.dark .btn.btn-toggle-off {
+  border-color: #fc8181;
+  color: #feb2b2;
+  opacity: 0.85;
+}
 .btn.btn-secondary:hover {
   background: #e2e8f0;
 }

@@ -95,6 +95,7 @@
   let skillIndex = new Map();   // normalized name -> { name, score, checkType, category }
   let skillIdIndex = new Map(); // id string -> skill object
   let allSkillNames = [];
+  let autoIncludeBase = true;
 
   // Performance optimization: track active skill keys for O(1) duplicate detection
   const activeSkillKeys = new Map(); // skillKey -> rowId
@@ -1657,7 +1658,7 @@
         }
         return;
       }
-    if (!allowCreate || currentLinkedId) return;
+    if (!allowCreate || currentLinkedId || !autoIncludeBase) return;
     const linked = makeRow();
     linked.classList.add('linked-lower');
     linked.dataset.parentGoldId = id;
@@ -1767,7 +1768,12 @@
       // Prefer explicit lowerSkillId; otherwise, try parentIds (common for gold -> lower)
       const candidateId = skill.lowerSkillId || (Array.isArray(skill.parentIds) ? skill.parentIds[0] : '');
       if (!candidateId) return;
-      const lower = skillIdIndex.get(String(candidateId));
+      let lower = skillIdIndex.get(String(candidateId));
+      if (!lower) {
+        for (const s of skillIndex.values()) {
+          if (String(s.skillId) === String(candidateId)) { lower = s; break; }
+        }
+      }
       if (!lower) return;
       const lowerInput = linkedRow.querySelector('.skill-name');
       const lowerCostInput = linkedRow.querySelector('.cost');
@@ -1797,6 +1803,10 @@
           const matches = allSkillNames.filter(n => n.toLowerCase().includes(lower));
           if (matches.length === 1) {
             skillInput.value = matches[0];
+          } else if (autoIncludeBase && matches.length > 1 && matches.length <= 3) {
+            const hasDoubleCircle = matches.some(n => n.endsWith(' ◎'));
+            const singleCircle = matches.find(n => n.endsWith(' ○'));
+            if (hasDoubleCircle && singleCircle) skillInput.value = singleCircle;
           }
         }
         syncSkillCategory({ triggerOptimize: true, updateCost: true });
@@ -2446,6 +2456,16 @@
   }
 
   // events
+  const autoIncludeBtn = document.getElementById('auto-include-btn');
+  if (autoIncludeBtn) {
+    autoIncludeBtn.addEventListener('click', () => {
+      autoIncludeBase = !autoIncludeBase;
+      autoIncludeBtn.textContent = `Auto-include: ${autoIncludeBase ? 'ON' : 'OFF'}`;
+      autoIncludeBtn.classList.toggle('btn-toggle-on', autoIncludeBase);
+      autoIncludeBtn.classList.toggle('btn-toggle-off', !autoIncludeBase);
+    });
+  }
+
   if (addRowBtn) addRowBtn.addEventListener('click', () => {
     const newRow = makeRow();
     rowsEl.appendChild(newRow);
